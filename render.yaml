@@ -15,10 +15,10 @@ services:
         value: "1"
 
       # Player clients tried in order, "|" separated, until one returns data.
-      # "default" is yt-dlp's own tuned choice and the only one that reliably
-      # yields 1080p; "android" always works but caps at 360p, so it goes last.
+      # default/tv_embedded/web_embedded all give full 1080p; the android
+      # variants cap at 360p and exist only as a last resort.
       - key: YTDLP_CLIENTS
-        value: "default|web_safari,mweb|android,web"
+        value: "default|tv_embedded|web_embedded|android_vr|android,web"
 
       # Optional. Paste a Netscape-format cookies.txt here if YouTube starts
       # bot-checking this server. Left unset by default -- see README.

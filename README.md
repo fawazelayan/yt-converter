@@ -75,6 +75,23 @@ handled automatically: `docker-entrypoint.sh` fetches the latest `yt-dlp` on eve
 start (falling back to the baked-in build if the download fails), and `server.js` re-runs
 `yt-dlp -U` every 12 hours so a long-running warm instance does not go stale either.
 
+### What the free tier can actually handle
+
+The free instance is **0.1 CPU / 512 MB**, which is fine for one or two people at a time
+and not much more:
+
+| | Expect |
+|---|---|
+| 1080p MP4, 3½ min video | ~85 MB, ~2 min (stream copy, no re-encode) |
+| 320 kbps MP3, 3½ min video | ~8.5 MB, ~70 s (MP3 encoding is the slow part) |
+| Simultaneous downloads | 2 (`MAX_CONCURRENT_JOBS`) |
+| Bandwidth | ~100 GB/month, so roughly 1,000 HD videos |
+
+Beyond two at once the server returns "busy, try again in a few seconds" rather than
+accepting the work. That cap is deliberate: three concurrent 1080p jobs OOM the instance,
+and the resulting restart truncates *everyone's* in-flight download, not just the extra
+one. Refusing the third request is the much kinder failure.
+
 ### If YouTube starts bot-checking the server
 
 Datacenter IPs occasionally get "Sign in to confirm you're not a bot". The server already

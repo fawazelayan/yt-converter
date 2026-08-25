@@ -70,11 +70,21 @@ function getCookiesArgs() {
 //    downloads get throttled. We already ship Node, so Node is the runtime --
 //    but only pass the flag if this yt-dlp build understands it.
 //
-// 2. The player client. Pinning "android" dodges bot checks but caps every
-//    video at 360p, so it is the last resort, not the default. We walk the
-//    chain in order and keep the first client that actually returns data.
+// 2. The player client. YouTube bot-checks datacenter IPs on some videos but
+//    not others, so a single client is never enough. Clients are not
+//    interchangeable either -- they differ in the formats they expose:
+//
+//      default      1080p avc1 + aac   best quality, first choice
+//      tv_embedded  1080p avc1 + aac   full quality AND dodges many bot checks
+//      web_embedded 1080p avc1 + aac   same idea, different surface
+//      android_vr     360p avc1        degraded, but works when others do not
+//      android,web    360p avc1        last resort
+//
+//    Order therefore runs best-quality-first and only degrades once the
+//    full-quality clients are exhausted, so a bot check costs resolution only
+//    when there is genuinely no alternative.
 // ---------------------------------------------------------------------------
-const CLIENT_CHAIN = (process.env.YTDLP_CLIENTS || 'default|web_safari,mweb|android,web')
+const CLIENT_CHAIN = (process.env.YTDLP_CLIENTS || 'default|tv_embedded|web_embedded|android_vr|android,web')
   .split('|')
   .map((c) => c.trim())
   .filter(Boolean);
