@@ -132,11 +132,19 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ---------------------------------------------------------
-  // Server state & API Base (for local & GitHub Pages)
+  // Server state & API Base (Default: live Render cloud backend)
   // ---------------------------------------------------------
 
+  const DEFAULT_CLOUD_BACKEND = 'https://yt-converter-backend-hw8r.onrender.com';
+
   function getApiBase() {
-    return (localStorage.getItem('ytdownloader_backend_url') || '').trim().replace(/\/+$/, '');
+    const custom = (localStorage.getItem('ytdownloader_backend_url') || '').trim();
+    if (custom) return custom.replace(/\/+$/, '');
+    // Automatically use the live Render backend when hosted on GitHub Pages or custom domain
+    if (window.location.hostname.endsWith('github.io') || (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')) {
+      return DEFAULT_CLOUD_BACKEND;
+    }
+    return '';
   }
 
   function apiUrl(path) {
@@ -158,26 +166,21 @@ document.addEventListener('DOMContentLoaded', () => {
       })
       .catch(() => {
         serverState.dataset.state = 'offline';
-        if (window.location.hostname.endsWith('github.io') && !getApiBase()) {
-          serverStateText.textContent = 'Set Backend';
-        } else {
-          serverStateText.textContent = 'Server unreachable';
-        }
+        serverStateText.textContent = 'Server starting…';
       });
   }
 
   checkServerStatus();
 
-  // Allow clicking the server status badge to view / set backend URL
+  // Allow clicking the server status badge to view / customize backend URL
   serverState.style.cursor = 'pointer';
-  serverState.title = 'Click to configure backend API URL';
+  serverState.title = 'Click to view or customize backend API URL';
   serverState.addEventListener('click', () => {
     const current = getApiBase();
-    const isGhPages = window.location.hostname.endsWith('github.io');
-    const msg = isGhPages
-      ? 'GitHub Pages requires a cloud backend server (e.g. Render / Railway / ngrok).\nEnter your backend URL (or leave blank for localhost:3000):'
-      : 'Backend URL (leave blank for local http://localhost:3000):';
-    const input = prompt(msg, current);
+    const input = prompt(
+      `Backend Server URL (currently: ${current || 'localhost'}):\nLeave blank to reset to default Render cloud backend:`,
+      localStorage.getItem('ytdownloader_backend_url') || ''
+    );
     if (input !== null) {
       const trimmed = input.trim();
       if (trimmed) {
@@ -185,7 +188,7 @@ document.addEventListener('DOMContentLoaded', () => {
         toast(`Backend set to ${trimmed}`, 'ok');
       } else {
         localStorage.removeItem('ytdownloader_backend_url');
-        toast('Using default local backend', 'info');
+        toast('Using default cloud backend', 'info');
       }
       checkServerStatus();
     }
