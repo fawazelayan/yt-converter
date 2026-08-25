@@ -8,8 +8,15 @@ const ffmpegPath = require('ffmpeg-static');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Path to yt-dlp binary
-const ytDlpPath = path.join(__dirname, 'yt-dlp.exe');
+// Path to yt-dlp binary (cross-platform: local yt-dlp.exe, local yt-dlp, or system yt-dlp in PATH)
+function getBinaryPath() {
+  const localExe = path.join(__dirname, 'yt-dlp.exe');
+  if (fs.existsSync(localExe)) return localExe;
+  const localBin = path.join(__dirname, 'yt-dlp');
+  if (fs.existsSync(localBin)) return localBin;
+  return process.env.YT_DLP_PATH || 'yt-dlp';
+}
+const ytDlpPath = getBinaryPath();
 const TEMP_DIR = path.join(__dirname, 'downloads_temp');
 
 // Ensure temp directory exists
@@ -635,9 +642,22 @@ app.get('/api/download/:jobId', (req, res) => {
 
 // Endpoint: Health status
 app.get('/api/status', (req, res) => {
+  let ytDlpAvailable = false;
+  if (fs.existsSync(ytDlpPath)) {
+    ytDlpAvailable = true;
+  } else {
+    try {
+      const { execFileSync } = require('child_process');
+      execFileSync(ytDlpPath, ['--version'], { stdio: 'ignore' });
+      ytDlpAvailable = true;
+    } catch (e) {
+      ytDlpAvailable = false;
+    }
+  }
+
   res.json({
     status: 'online',
-    ytDlpAvailable: fs.existsSync(ytDlpPath),
+    ytDlpAvailable,
     ffmpegAvailable: !!ffmpegPath && fs.existsSync(ffmpegPath)
   });
 });

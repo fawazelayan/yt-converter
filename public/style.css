@@ -160,8 +160,21 @@ svg:not(.sprite) {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--ink-3);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-1);
+  border: 1px solid var(--edge-1);
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.2s ease;
+}
+
+.server-state:hover {
+  background: var(--surface-2);
+  border-color: var(--edge-2);
+  color: var(--ink-1);
 }
 
 .server-dot {

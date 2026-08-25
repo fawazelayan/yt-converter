@@ -132,20 +132,64 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ---------------------------------------------------------
-  // Server state
+  // Server state & API Base (for local & GitHub Pages)
   // ---------------------------------------------------------
 
-  fetch('/api/status')
-    .then((r) => (r.ok ? r.json() : Promise.reject()))
-    .then((s) => {
-      const ready = s.ytDlpAvailable && s.ffmpegAvailable;
-      serverState.dataset.state = ready ? 'online' : 'offline';
-      serverStateText.textContent = ready ? 'Ready' : 'Missing yt-dlp or ffmpeg';
-    })
-    .catch(() => {
-      serverState.dataset.state = 'offline';
-      serverStateText.textContent = 'Server unreachable';
-    });
+  function getApiBase() {
+    return (localStorage.getItem('ytdownloader_backend_url') || '').trim().replace(/\/+$/, '');
+  }
+
+  function apiUrl(path) {
+    const base = getApiBase();
+    if (!path.startsWith('/')) path = '/' + path;
+    return `${base}${path}`;
+  }
+
+  function checkServerStatus() {
+    serverState.dataset.state = 'checking';
+    serverStateText.textContent = 'Connecting';
+
+    fetch(apiUrl('/api/status'))
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((s) => {
+        const ready = s.ytDlpAvailable && s.ffmpegAvailable;
+        serverState.dataset.state = ready ? 'online' : 'offline';
+        serverStateText.textContent = ready ? 'Ready' : 'Missing yt-dlp or ffmpeg';
+      })
+      .catch(() => {
+        serverState.dataset.state = 'offline';
+        if (window.location.hostname.endsWith('github.io') && !getApiBase()) {
+          serverStateText.textContent = 'Set Backend';
+        } else {
+          serverStateText.textContent = 'Server unreachable';
+        }
+      });
+  }
+
+  checkServerStatus();
+
+  // Allow clicking the server status badge to view / set backend URL
+  serverState.style.cursor = 'pointer';
+  serverState.title = 'Click to configure backend API URL';
+  serverState.addEventListener('click', () => {
+    const current = getApiBase();
+    const isGhPages = window.location.hostname.endsWith('github.io');
+    const msg = isGhPages
+      ? 'GitHub Pages requires a cloud backend server (e.g. Render / Railway / ngrok).\nEnter your backend URL (or leave blank for localhost:3000):'
+      : 'Backend URL (leave blank for local http://localhost:3000):';
+    const input = prompt(msg, current);
+    if (input !== null) {
+      const trimmed = input.trim();
+      if (trimmed) {
+        localStorage.setItem('ytdownloader_backend_url', trimmed);
+        toast(`Backend set to ${trimmed}`, 'ok');
+      } else {
+        localStorage.removeItem('ytdownloader_backend_url');
+        toast('Using default local backend', 'info');
+      }
+      checkServerStatus();
+    }
+  });
 
   // ---------------------------------------------------------
   // Link intake
@@ -191,7 +235,7 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchBtnText.textContent = 'Finding…';
 
     try {
-      const response = await fetch('/api/info', {
+      const response = await fetch(apiUrl('/api/info'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url })
@@ -330,7 +374,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // Fallback to HTML5 video if YT Iframe API isn't available
       ytPlayerContainer.classList.add('is-hidden');
       previewVideo.classList.remove('is-hidden');
-      previewVideo.src = video.preview_url || `/api/stream-preview?url=${encodeURIComponent(video.url)}`;
+      previewVideo.src = video.preview_url || apiUrl(`/api/stream-preview?url=${encodeURIComponent(video.url)}`);
       if (video.thumbnail) previewVideo.poster = video.thumbnail;
       previewVideo.muted = false;
     }
@@ -607,9 +651,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const { value: quality } = selectedQuality();
     const title = video.title || 'YouTube download';
 
-    const href =
+    const href = apiUrl(
       `/api/download?url=${encodeURIComponent(video.url)}` +
-      `&format=${format}&quality=${quality}&title=${encodeURIComponent(title)}`;
+      `&format=${format}&quality=${quality}&title=${encodeURIComponent(title)}`
+    );
 
     triggerSave(href, `${title}.${format}`);
     toast('Your browser is saving the file now.', 'ok');
@@ -630,7 +675,7 @@ document.addEventListener('DOMContentLoaded', () => {
     downloadBtn.disabled = true;
 
     try {
-      const response = await fetch('/api/convert-trim', {
+      const response = await fetch(apiUrl('/api/convert-trim'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -652,7 +697,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function followJob(jobId, title, format) {
-    activeStream = new EventSource(`/api/progress/${jobId}`);
+    activeStream = new EventSource(apiUrl(`/api/progress/${jobId}`));
 
     activeStream.onmessage = (event) => {
       let data;
@@ -674,7 +719,8 @@ document.addEventListener('DOMContentLoaded', () => {
         jobPercent.textContent = '100%';
         jobText.textContent = `Clip ready · ${data.size || megabytes(estimatedBytes())}`;
 
-        const href = data.downloadUrl || `/api/download/${jobId}?title=${encodeURIComponent(title)}`;
+        const rawHref = data.downloadUrl || `/api/download/${jobId}?title=${encodeURIComponent(title)}`;
+        const href = rawHref.startsWith('http') ? rawHref : apiUrl(rawHref);
         jobSaveBtn.href = href;
         jobSaveBtn.setAttribute('download', `${title}.${format}`);
         jobActions.classList.remove('is-hidden');
