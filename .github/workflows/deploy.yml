@@ -27,6 +27,15 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
+      # GitHub Pages serves assets with Cache-Control: max-age=600, so an
+      # unversioned app.js leaves visitors running stale code long after a
+      # deploy -- which looks exactly like the backend being down. Stamp the
+      # commit SHA onto the asset URLs so every deploy is a fresh URL.
+      - name: Cache-bust static assets
+        run: |
+          sed -i "s/?v=DEV/?v=${GITHUB_SHA}/g" public/index.html
+          grep -n "?v=" public/index.html
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
