@@ -56,9 +56,13 @@ from a broken site.
 
 Two things handle it, both free:
 
-- **`.github/workflows/keepalive.yml`** pings `/api/status` every 10 minutes so the instance
-  effectively never sleeps. One always-on service uses ~744 of the 750 free instance hours
-  per month, so it stays inside the free plan.
+- **`.github/workflows/keepalive.yml`** pings `/api/status` every 10 minutes **during waking
+  hours only** (05:00–21:59 UTC = 08:00–00:59 local). This is deliberate: Render grants
+  750 free instance hours per *workspace* per month and suspends every free service until
+  the next month once that runs out. A genuinely always-on service burns ~744 h of that, so
+  round-the-clock pinging would leave ~6 h of headroom and eventually get the workspace
+  suspended. The waking-hours schedule uses ~527 h and leaves >200 h spare; the only cost is
+  a one-minute wake-up if someone opens the site overnight.
 - **The frontend waits for the wake-up** instead of failing. The status badge shows
   `Waking server… 12s` and the request goes through once the backend answers.
 

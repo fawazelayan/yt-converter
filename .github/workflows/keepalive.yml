@@ -1,14 +1,23 @@
 name: Keep backend awake
 
 # Render's free tier spins a service down after 15 minutes of inactivity, and
-# the next request then pays a ~50 second cold start -- which reads as "the site
-# is broken" to anyone who is not the developer. Pinging every 10 minutes keeps
-# the instance warm around the clock. One always-on free service uses roughly
-# 744 of the 750 free instance hours per month, so this stays inside the plan.
+# the next request pays a ~50 second cold start -- which reads as "the site is
+# broken" to anyone who is not the developer.
+#
+# The catch: Render grants 750 free instance hours per WORKSPACE per month and
+# suspends every free service until the next month once that runs out. A truly
+# always-on service burns ~744 h in a 31-day month, leaving about six hours of
+# headroom -- so a single redeploy or a second free service would get the whole
+# workspace suspended, most likely late in the month.
+#
+# So we keep it warm only across waking hours: 05:00-21:59 UTC is 08:00-00:59
+# local (UTC+3), about 527 h/month. That leaves >200 h of headroom, and the only
+# cost is a one-minute wake-up if someone opens the site overnight -- which the
+# frontend already handles by waiting and showing "Waking server...".
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 5-21 * * *"
   workflow_dispatch:
 
 permissions:
