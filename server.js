@@ -141,13 +141,15 @@ app.post('/api/info', (req, res) => {
   }
 
   const videoId = extractVideoId(cleanUrl);
+  const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : cleanUrl;
 
   const args = [
     '--dump-single-json',
     '--no-playlist',
     '--no-warnings',
     '--skip-download',
-    cleanUrl
+    '--extractor-args', 'youtube:player_client=android,web',
+    targetUrl
   ];
 
   execFile(ytDlpPath, args, { maxBuffer: 25 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -318,18 +320,21 @@ app.get('/api/stream-preview', (req, res) => {
   if (!url || typeof url !== 'string' || !url.trim()) {
     return res.status(400).send('Please provide a valid video URL.');
   }
+  const videoId = extractVideoId(url);
+  const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
 
   const args = [
     '--no-playlist',
     '--no-warnings',
+    '--extractor-args', 'youtube:player_client=android,web',
     '-f', 'best[height<=720][ext=mp4]/best[height<=720]/b/best',
     '-g',
-    url.trim()
+    targetUrl
   ];
 
   execFile(ytDlpPath, args, { timeout: 15000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
-      execFile(ytDlpPath, ['--no-playlist', '--no-warnings', '-g', url.trim()], { timeout: 15000 }, (fbErr, fbStdout) => {
+      execFile(ytDlpPath, ['--no-playlist', '--no-warnings', '--extractor-args', 'youtube:player_client=android,web', '-g', targetUrl], { timeout: 15000 }, (fbErr, fbStdout) => {
         if (fbErr || !fbStdout.trim()) {
           return res.status(500).send('Could not extract preview stream URL.');
         }
@@ -416,13 +421,20 @@ app.post('/api/convert-trim', (req, res) => {
   const heightVal = parseInt(quality, 10) || 1080;
 
   // Single-pass high speed section download with yt-dlp & ffmpeg
+  const videoId = extractVideoId(url);
+  const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
+
   const ytdlArgs = [
     '--no-playlist',
     '--no-warnings',
     '--newline',
-    '--ffmpeg-location', ffmpegPath,
-    '--download-sections', `*${startClock}-${endClock}`
+    '--extractor-args', 'youtube:player_client=android,web',
+    '--download-sections', `*${startClock}-${endClock}`,
+    '--force-keyframes-at-cuts',
   ];
+  if (ffmpegPath) {
+    ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+  }
 
   if (isAudio) {
     const audioBitrate = String(quality).replace(/\D/g, '') || '320';
@@ -441,7 +453,7 @@ app.post('/api/convert-trim', (req, res) => {
     );
   }
 
-  ytdlArgs.push(url.trim());
+  ytdlArgs.push(targetUrl);
 
   console.log(`[Job ${jobId}] Starting Clip Download (${startClock} to ${endClock}):`, ytdlArgs.join(' '));
   const dlProc = spawn(ytDlpPath, ytdlArgs);
@@ -530,7 +542,8 @@ app.get('/api/download', (req, res) => {
     return res.status(400).send('Please provide a valid YouTube link.');
   }
 
-  const cleanUrl = url.trim();
+  const videoId = extractVideoId(cleanUrl);
+  const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : cleanUrl;
   const isMp3 = String(format).toLowerCase() === 'mp3';
   const ext = isMp3 ? 'mp3' : 'mp4';
   const rawTitle = title || 'YouTube_Download';
@@ -538,7 +551,14 @@ app.get('/api/download', (req, res) => {
   res.setHeader('Content-Disposition', getSafeFilenameHeader(rawTitle, ext));
   res.setHeader('Content-Type', isMp3 ? 'audio/mpeg' : 'video/mp4');
 
-  const ytdlArgs = ['--no-playlist', '--no-warnings', '--ffmpeg-location', ffmpegPath];
+  const ytdlArgs = [
+    '--no-playlist',
+    '--no-warnings',
+    '--extractor-args', 'youtube:player_client=android,web'
+  ];
+  if (ffmpegPath) {
+    ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+  }
   let ffmpegArgs;
 
   if (isMp3) {
@@ -559,7 +579,7 @@ app.get('/api/download', (req, res) => {
       '-f', 'mp4', 'pipe:1'];
   }
 
-  ytdlArgs.push('-o', '-', cleanUrl);
+  ytdlArgs.push('-o', '-', targetUrl);
 
   console.log(`Direct download "${rawTitle}" (${ext}):`, ytdlArgs.join(' '));
 
