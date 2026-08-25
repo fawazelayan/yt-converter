@@ -302,7 +302,13 @@ app.post('/api/info', (req, res) => {
   runYtDlpWithFallback(makeArgs, { maxBuffer: 64 * 1024 * 1024, timeout: 90000 }, (err, stdout, stderr, client) => {
     if (err) {
       console.error('yt-dlp info error:', stderr);
-      return res.status(400).json({ error: describeYtDlpError(stderr) });
+      // `error` is the only field the UI renders. `details` carries the raw
+      // yt-dlp tail so a failure can be diagnosed against the live backend
+      // without shell access to the container.
+      return res.status(400).json({
+        error: describeYtDlpError(stderr),
+        details: String(stderr || '').trim().slice(-600)
+      });
     }
     console.log(`[info] resolved via player client "${client}"`);
 
