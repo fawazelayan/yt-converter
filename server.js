@@ -141,6 +141,23 @@ if (!fs.existsSync(TEMP_DIR)) {
 const activeJobs = new Map();
 const sseClients = new Map();
 
+// The free cloud instance runs on 0.1 CPU and 512 MB. Two or three simultaneous
+// 1080p jobs are enough to OOM it, and a crash kills every in-flight download
+// rather than just the surplus one. Turning away the extra request is the far
+// kinder failure, so cap the heavy work and shed load early.
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || '2', 10);
+let activeHeavyJobs = 0;
+
+function acquireJobSlot() {
+  if (activeHeavyJobs >= MAX_CONCURRENT_JOBS) return false;
+  activeHeavyJobs++;
+  return true;
+}
+
+function releaseJobSlot() {
+  activeHeavyJobs = Math.max(0, activeHeavyJobs - 1);
+}
+
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
@@ -493,8 +510,22 @@ app.post('/api/convert-trim', (req, res) => {
   const ext = isAudio ? 'mp3' : 'mp4';
   const clipSeconds = endSec - startSec;
 
+  if (!acquireJobSlot()) {
+    return res.status(503).json({
+      error: 'The server is busy with other downloads right now. Please try again in a few seconds.'
+    });
+  }
+
   const jobId = 'trim_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
   const finalOutputFile = path.join(TEMP_DIR, `${jobId}.${ext}`);
+
+  const startClock = formatDuration(startSec);
+  const endClock = formatDuration(endSec);
+  const heightVal = parseInt(quality, 10) || 1080;
+
+  // Describe what was actually requested. This used to say "1080p" regardless of
+  // the chosen quality, so a 720p clip reported itself as 1080p all the way through.
+  const qualityLabel = isAudio ? 'audio' : `${heightVal}p`;
 
   const jobData = {
     id: jobId,
@@ -504,15 +535,11 @@ app.post('/api/convert-trim', (req, res) => {
     status: 'downloading',
     percent: 5,
     startTime: Date.now(),
-    lastStatus: { status: 'downloading', percent: 5, text: `Downloading ${isAudio ? 'audio' : '1080p video'} clip...` }
+    lastStatus: { status: 'downloading', percent: 5, text: `Downloading ${qualityLabel} clip...` }
   };
 
   activeJobs.set(jobId, jobData);
   res.json({ jobId });
-
-  const startClock = formatDuration(startSec);
-  const endClock = formatDuration(endSec);
-  const heightVal = parseInt(quality, 10) || 1080;
 
   // Single-pass high speed section download with yt-dlp & ffmpeg
   const videoId = extractVideoId(url);
@@ -560,7 +587,7 @@ app.post('/api/convert-trim', (req, res) => {
         jobData.lastStatus = {
           status: 'downloading',
           percent,
-          text: `Downloading ${isAudio ? 'audio' : '1080p'} clip: ${percent}%`
+          text: `Downloading ${qualityLabel} clip: ${percent}%`
         };
         sendJobEvent(jobId, jobData.lastStatus);
       }
@@ -577,19 +604,31 @@ app.post('/api/convert-trim', (req, res) => {
       jobData.lastStatus = {
         status: 'downloading',
         percent,
-        text: `Processing 1080p clip: ${percent}% (${Math.round(curSec)}s / ${clipSeconds}s)`
+        text: `Processing ${qualityLabel} clip: ${percent}% (${Math.round(curSec)}s / ${clipSeconds}s)`
       };
       sendJobEvent(jobId, jobData.lastStatus);
     }
   });
 
+  // A failed spawn emits both 'error' and 'close', so release through a latch
+  // rather than from each handler -- double-releasing would inflate the free
+  // slot count and defeat the concurrency cap.
+  let slotFreed = false;
+  const freeSlot = () => {
+    if (slotFreed) return;
+    slotFreed = true;
+    releaseJobSlot();
+  };
+
   dlProc.on('error', (err) => {
     console.error(`[Job ${jobId}] yt-dlp spawn error:`, err);
+    freeSlot();
     jobData.lastStatus = { status: 'error', message: 'Could not start the clip download.' };
     sendJobEvent(jobId, jobData.lastStatus);
   });
 
   dlProc.on('close', (dlCode) => {
+    freeSlot();
     // Check if yt-dlp saved under the expected or part filename
     let finalFile = fs.existsSync(finalOutputFile) ? finalOutputFile : null;
     if (!finalFile) {
@@ -640,6 +679,21 @@ app.get('/api/download', (req, res) => {
   const isMp3 = String(format).toLowerCase() === 'mp3';
   const ext = isMp3 ? 'mp3' : 'mp4';
   const rawTitle = title || 'YouTube_Download';
+
+  if (!acquireJobSlot()) {
+    res.setHeader('Retry-After', '30');
+    return res.status(503).send('The server is busy with other downloads right now. Please try again in a few seconds.');
+  }
+  // The slot covers the whole request, retries included. Both events fire on
+  // every exit path, so release exactly once from whichever lands first.
+  let slotReleased = false;
+  const releaseOnce = () => {
+    if (slotReleased) return;
+    slotReleased = true;
+    releaseJobSlot();
+  };
+  res.on('close', releaseOnce);
+  res.on('finish', releaseOnce);
 
   // Response headers are deliberately NOT set yet. This is a browser-initiated
   // navigation, so once a byte goes out we are committed to that response and
@@ -711,8 +765,16 @@ app.get('/api/download', (req, res) => {
       settled = true;
       stop();
       if (clientAborted) return;
-      if (ok || streaming) {
+
+      if (ok) {
         res.end();
+      } else if (streaming) {
+        // Bytes are already on the wire, so neither a retry nor an error status
+        // is possible. Destroy the connection rather than end() it: a clean end
+        // looks like a completed download and would quietly hand the user a
+        // truncated file. Aborting makes the browser flag it as failed.
+        console.error(`[download] stream died mid-transfer: ${lastError.slice(-200)}`);
+        res.destroy();
       } else {
         console.warn(`[download] client "${client}" produced no data: ${lastError.slice(-200)}`);
         attempt(index + 1);
@@ -812,26 +874,40 @@ function probeBinary(bin, args, cb) {
 }
 
 app.get('/api/status', (req, res) => {
-  const now = Date.now();
-  if (healthCache.payload && now - healthCache.at < 60000) {
-    return res.json(healthCache.payload);
+  // Only the binary probes are cached -- they cost two process spawns and never
+  // change between deploys. Live counters are always computed fresh, because the
+  // client uses activeJobs to decide whether a slot is free before starting a
+  // download, and a stale count there would be worse than useless.
+  const respond = (probes) => {
+    res.json({
+      status: 'online',
+      ytDlpAvailable: probes.ytOk,
+      ffmpegAvailable: probes.ffOk,
+      ytDlpVersion: probes.ytVersion || null,
+      ffmpegVersion: probes.ffVersion || null,
+      jsRuntime: jsRuntimeArgs.length ? jsRuntimeArgs[1] : null,
+      cookies: fs.existsSync(cookiesFilePath),
+      clients: CLIENT_CHAIN,
+      activeJobs: activeHeavyJobs,
+      maxJobs: MAX_CONCURRENT_JOBS,
+      uptime: Math.round(process.uptime())
+    });
+  };
+
+  if (healthCache.payload && Date.now() - healthCache.at < 60000) {
+    return respond(healthCache.payload);
   }
 
   probeBinary(ytDlpPath, ['--version'], (ytOk, ytVersion) => {
     probeBinary(ffmpegPath, ['-version'], (ffOk, ffVersion) => {
-      const payload = {
-        status: 'online',
-        ytDlpAvailable: ytOk,
-        ffmpegAvailable: ffOk,
-        ytDlpVersion: ytVersion || null,
-        ffmpegVersion: ffVersion ? ffVersion.replace(/^ffmpeg version /, '').split(' ')[0] : null,
-        jsRuntime: jsRuntimeArgs.length ? jsRuntimeArgs[1] : null,
-        cookies: fs.existsSync(cookiesFilePath),
-        clients: CLIENT_CHAIN,
-        uptime: Math.round(process.uptime())
+      const probes = {
+        ytOk,
+        ffOk,
+        ytVersion,
+        ffVersion: ffVersion ? ffVersion.replace(/^ffmpeg version /, '').split(' ')[0] : null
       };
-      healthCache = { at: Date.now(), payload };
-      res.json(payload);
+      healthCache = { at: Date.now(), payload: probes };
+      respond(probes);
     });
   });
 });

@@ -745,6 +745,15 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
+      // The browser swallows the response status on a link-triggered download,
+      // so a "server busy" 503 would surface as a mystery failed download. Check
+      // for a free slot first and say so plainly instead.
+      const health = await pingStatus(20000).catch(() => null);
+      if (health && health.maxJobs && health.activeJobs >= health.maxJobs) {
+        toast('The server is busy with another download. Try again in a few seconds.', 'error');
+        return;
+      }
+
       const href = apiUrl(
         `/api/download?url=${encodeURIComponent(video.url)}` +
         `&format=${format}&quality=${quality}&title=${encodeURIComponent(title)}`
