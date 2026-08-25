@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
 
 // Resolve ffmpeg. Inside the Alpine container the distro build (installed via
 // apk) is the safest choice; ffmpeg-static is the fallback for local dev.
@@ -68,7 +68,7 @@ function getCookiesArgs() {
 // 1. A JavaScript runtime. Modern yt-dlp needs one to solve YouTube's
 //    signature/nsig challenges. Without it formats silently vanish and
 //    downloads get throttled. We already ship Node, so Node is the runtime --
-//    but only pass the flag if this yt-dlp build understands it.
+//    configured synchronously on startup to prevent cold-start race conditions.
 //
 // 2. The player client. YouTube bot-checks datacenter IPs on some videos but
 //    not others, so a single client is never enough. Clients are not
@@ -89,18 +89,22 @@ const CLIENT_CHAIN = (process.env.YTDLP_CLIENTS || 'default|tv_embedded|web_embe
   .map((c) => c.trim())
   .filter(Boolean);
 
-let jsRuntimeArgs = [];
-(function detectJsRuntimeSupport() {
-  if (process.env.YTDLP_JS_RUNTIME === 'off') return;
-  execFile(ytDlpPath, ['--help'], { maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
-    if (err || !stdout || !stdout.includes('--js-runtimes')) {
+let jsRuntimeArgs = ['--js-runtimes', process.env.YTDLP_JS_RUNTIME || 'node'];
+if (process.env.YTDLP_JS_RUNTIME === 'off') {
+  jsRuntimeArgs = [];
+} else {
+  try {
+    const helpOutput = execFileSync(ytDlpPath, ['--help'], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    if (!helpOutput.includes('--js-runtimes')) {
+      jsRuntimeArgs = [];
       console.log('[yt-dlp] --js-runtimes not supported by this build, skipping');
-      return;
+    } else {
+      console.log('[yt-dlp] using JS runtime:', jsRuntimeArgs[1]);
     }
-    jsRuntimeArgs = ['--js-runtimes', process.env.YTDLP_JS_RUNTIME || 'node'];
-    console.log('[yt-dlp] using JS runtime:', jsRuntimeArgs[1]);
-  });
-})();
+  } catch (e) {
+    console.log('[yt-dlp] using default JS runtime:', jsRuntimeArgs[1]);
+  }
+}
 
 // Args shared by every yt-dlp invocation, for one client strategy.
 function buildBaseArgs(client) {
@@ -111,6 +115,9 @@ function buildBaseArgs(client) {
     '--retries', '5',
     '--fragment-retries', '5',
     '--extractor-retries', '3',
+    '--http-chunk-size', '10M',
+    '--buffer-size', '16M',
+    '--resize-buffer',
     ...jsRuntimeArgs,
     ...getCookiesArgs()
   ];
@@ -573,6 +580,7 @@ app.post('/api/convert-trim', (req, res) => {
   const ytdlArgs = [
     ...buildBaseArgs(CLIENT_CHAIN[0]),
     '--newline',
+    '--concurrent-fragments', '5',
     '--download-sections', `*${startClock}-${endClock}`,
     '--force-keyframes-at-cuts',
   ];
@@ -690,6 +698,163 @@ app.post('/api/convert-trim', (req, res) => {
   });
 });
 
+// Endpoint: Ultra Fast Full Video/Audio Download with Real-Time Progress Tracking
+app.post('/api/convert-full', (req, res) => {
+  const {
+    url,
+    format = 'mp4',
+    quality = '1080',
+    title = 'Download'
+  } = req.body;
+
+  if (!url || typeof url !== 'string' || !url.trim()) {
+    return res.status(400).json({ error: 'Please provide a valid video link.' });
+  }
+
+  const isAudio = String(format).toLowerCase() === 'mp3';
+  const ext = isAudio ? 'mp3' : 'mp4';
+
+  if (!acquireJobSlot()) {
+    return res.status(503).json({
+      error: 'The server is busy with other downloads right now. Please try again in a few seconds.'
+    });
+  }
+
+  const jobId = 'dl_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+  const finalOutputFile = path.join(TEMP_DIR, `${jobId}.${ext}`);
+  const heightVal = parseInt(quality, 10) || 1080;
+  const qualityLabel = isAudio ? 'audio' : `${heightVal}p`;
+
+  const jobData = {
+    id: jobId,
+    format: ext,
+    url: url.trim(),
+    quality,
+    status: 'downloading',
+    percent: 5,
+    startTime: Date.now(),
+    lastStatus: { status: 'downloading', percent: 5, text: `Downloading ${qualityLabel}...` }
+  };
+
+  activeJobs.set(jobId, jobData);
+  res.json({ jobId });
+
+  const videoId = extractVideoId(url);
+  const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
+
+  const ytdlArgs = [
+    ...buildBaseArgs(CLIENT_CHAIN[0]),
+    '--newline',
+    '--concurrent-fragments', '5',
+  ];
+  if (ffmpegPath) {
+    ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+  }
+
+  if (isAudio) {
+    const audioBitrate = String(quality).replace(/\D/g, '') || '320';
+    ytdlArgs.push(
+      '-f', 'bestaudio/best',
+      '-x',
+      '--audio-format', 'mp3',
+      '--audio-quality', `${audioBitrate}k`,
+      '-o', finalOutputFile
+    );
+  } else {
+    ytdlArgs.push(
+      '-f', `bestvideo[height<=?${heightVal}]+bestaudio/best[height<=?${heightVal}]/best`,
+      '--merge-output-format', 'mp4',
+      '-o', finalOutputFile
+    );
+  }
+
+  ytdlArgs.push(targetUrl);
+
+  console.log(`[Job ${jobId}] Starting Full High-Speed Download (${qualityLabel}):`, ytdlArgs.join(' '));
+  const dlProc = spawn(ytDlpPath, ytdlArgs);
+
+  dlProc.stdout.on('data', (chunk) => {
+    for (const line of chunk.toString().split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const dlMatch = trimmed.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+      if (dlMatch) {
+        const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
+        jobData.lastStatus = {
+          status: 'downloading',
+          percent,
+          text: `Downloading ${qualityLabel}: ${percent}%`
+        };
+        sendJobEvent(jobId, jobData.lastStatus);
+      }
+    }
+  });
+
+  dlProc.stderr.on('data', (chunk) => {
+    const str = chunk.toString();
+    const dlMatch = str.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+    if (dlMatch) {
+      const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
+      jobData.lastStatus = {
+        status: 'downloading',
+        percent,
+        text: `Downloading ${qualityLabel}: ${percent}%`
+      };
+      sendJobEvent(jobId, jobData.lastStatus);
+    }
+  });
+
+  let slotFreed = false;
+  const freeSlot = () => {
+    if (slotFreed) return;
+    slotFreed = true;
+    releaseJobSlot();
+  };
+
+  dlProc.on('error', (err) => {
+    console.error(`[Job ${jobId}] yt-dlp spawn error:`, err);
+    freeSlot();
+    jobData.lastStatus = { status: 'error', message: 'Could not start the download.' };
+    sendJobEvent(jobId, jobData.lastStatus);
+  });
+
+  dlProc.on('close', (dlCode) => {
+    freeSlot();
+    let finalFile = fs.existsSync(finalOutputFile) ? finalOutputFile : null;
+    if (!finalFile) {
+      const stray = fs.readdirSync(TEMP_DIR).find((f) => f.startsWith(jobId) && !f.endsWith('.part'));
+      if (stray) finalFile = path.join(TEMP_DIR, stray);
+    }
+
+    if (dlCode !== 0 || !finalFile || !fs.existsSync(finalFile)) {
+      console.error(`[Job ${jobId}] Download failed with code ${dlCode}`);
+      jobData.lastStatus = {
+        status: 'error',
+        message: 'Could not complete the download. Check your connection and try again.'
+      };
+      sendJobEvent(jobId, jobData.lastStatus);
+      return;
+    }
+
+    const stat = fs.statSync(finalFile);
+    const size = formatFileSize(stat.size);
+
+    jobData.fileName = `${jobId}.${ext}`;
+    jobData.filePath = finalFile;
+    jobData.fileSize = size;
+    jobData.lastStatus = {
+      status: 'completed',
+      percent: 100,
+      jobId,
+      fileName: `${jobId}.${ext}`,
+      size,
+      downloadUrl: `/api/download/${jobId}?title=${encodeURIComponent(title || 'Download')}`,
+      text: `Ready · ${size}`
+    };
+    sendJobEvent(jobId, jobData.lastStatus);
+  });
+});
+
 // Endpoint: Direct streaming download (no trim) — MP3 or MP4
 app.get('/api/download', (req, res) => {
   const { url, format = 'mp3', quality = '320', title } = req.query;
@@ -750,7 +915,7 @@ app.get('/api/download', (req, res) => {
     if (isMp3) {
       const bitrate = String(quality).replace(/\D/g, '') || '320';
       ytdlArgs.push('-f', 'bestaudio/best');
-      ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+      ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-threads', '0', '-i', 'pipe:0',
         '-vn', '-c:a', 'libmp3lame', '-b:a', `${bitrate}k`, '-f', 'mp3', 'pipe:1'];
     } else {
       const heightVal = parseInt(quality, 10);
@@ -758,7 +923,7 @@ app.get('/api/download', (req, res) => {
       ytdlArgs.push(
         '-f', `bestvideo${cap}[vcodec^=avc1][protocol^=http]+bestaudio[acodec^=mp4a][protocol^=http]/bestvideo${cap}[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best${cap}[vcodec^=avc1]/best${cap}[ext=mp4]/best`
       );
-      ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+      ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-threads', '0', '-i', 'pipe:0',
         '-c', 'copy',
         '-bsf:a', 'aac_adtstoasc',
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',

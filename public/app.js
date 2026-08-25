@@ -747,44 +747,34 @@ document.addEventListener('DOMContentLoaded', () => {
     const format = currentFormat();
     const { value: quality } = selectedQuality();
     const title = video.title || 'YouTube download';
+    const qualityLabel = format === 'mp3' ? 'audio' : `${quality}p`;
 
-    // This hands the URL straight to the browser's downloader, which streams to
-    // disk without buffering the whole file in memory. The catch is that a
-    // failed response is invisible to us, so make sure the backend is actually
-    // awake before handing it over.
+    showJob(`Downloading ${qualityLabel}…`);
     downloadBtn.disabled = true;
+
     try {
       const awake = await wakeBackend();
       if (!awake) {
         backendReady = false;
-        toast('The download server is offline. Ask Fawaz to open his laptop.', 'error');
-        return;
+        throw new Error('The download server is offline. Ask Fawaz to open his laptop.');
       }
 
-      // The browser swallows the response status on a link-triggered download,
-      // so a "server busy" 503 would surface as a mystery failed download. Check
-      // for a free slot first and say so plainly instead.
-      const health = await pingStatus(20000).catch(() => null);
-      if (health && health.maxJobs && health.activeJobs >= health.maxJobs) {
-        toast('The server is busy with another download. Try again in a few seconds.', 'error');
-        return;
-      }
-
-      const href = apiUrl(
-        `/api/download?url=${encodeURIComponent(video.url)}` +
-        `&format=${format}&quality=${quality}&title=${encodeURIComponent(title)}`
-      );
-
-      triggerSave(href, `${title}.${format}`);
-      toast('Your browser is saving the file now.', 'ok');
-
-      remember({
-        title,
-        kind: format.toUpperCase(),
-        meta: megabytes(estimatedBytes()) || compact(duration)
+      const response = await fetch(apiUrl('/api/convert-full'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: video.url,
+          format,
+          quality,
+          title
+        })
       });
-    } finally {
-      downloadBtn.disabled = false;
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'The download job could not start.');
+
+      followJob(data.jobId, title, format);
+    } catch (err) {
+      failJob(err.message);
     }
   }
 
@@ -792,8 +782,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const format = currentFormat();
     const { value: quality } = selectedQuality();
     const title = `${video.title || 'Clip'} (${clock(clipFrom)}-${clock(clipTo)})`;
+    const qualityLabel = format === 'mp3' ? 'audio' : `${quality}p`;
 
-    showJob(`Downloading ${format === 'mp3' ? 'audio' : '1080p'} clip…`);
+    showJob(`Downloading ${qualityLabel} clip…`);
     downloadBtn.disabled = true;
 
     try {
@@ -845,7 +836,7 @@ document.addEventListener('DOMContentLoaded', () => {
         job.classList.add('is-done');
         jobFill.style.transform = 'scaleX(1)';
         jobPercent.textContent = '100%';
-        jobText.textContent = `Clip ready · ${data.size || megabytes(estimatedBytes())}`;
+        jobText.textContent = `Ready · ${data.size || megabytes(estimatedBytes())}`;
 
         const rawHref = data.downloadUrl || `/api/download/${jobId}?title=${encodeURIComponent(title)}`;
         const href = rawHref.startsWith('http') ? rawHref : apiUrl(rawHref);
@@ -855,18 +846,18 @@ document.addEventListener('DOMContentLoaded', () => {
         downloadBtn.disabled = false;
 
         triggerSave(href, `${title}.${format}`);
-        toast('Your 1080p clip is saved to downloads!', 'ok');
+        toast(`Your ${format.toUpperCase()} is saved to downloads!`, 'ok');
 
-        remember({ title, kind: 'CLIP', meta: data.size || megabytes(estimatedBytes()) });
+        remember({ title, kind: format.toUpperCase(), meta: data.size || megabytes(estimatedBytes()) });
       } else if (data.status === 'error') {
         closeStream();
-        failJob(data.message || 'Trimming failed.');
+        failJob(data.message || 'Download failed.');
       }
     };
 
     activeStream.onerror = () => {
       closeStream();
-      failJob('Lost contact with the server while trimming.');
+      failJob('Lost contact with the server during download.');
     };
   }
 
