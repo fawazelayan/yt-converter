@@ -20,6 +20,15 @@ function resolveFfmpegPath() {
 }
 const ffmpegPath = resolveFfmpegPath();
 
+// Global error handlers to prevent process crashing on stream aborts
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && (err.message || err));
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -867,11 +876,38 @@ app.get('/api/download/:jobId', (req, res) => {
 // keep-alive ping stays cheap.
 let healthCache = { at: 0, payload: null };
 
+// yt-dlp is a Python zip, and its first run on a cold 0.1-CPU instance can take
+// well over a minute. A short timeout here reports a perfectly good binary as
+// missing, which the frontend then refuses to work against -- so be patient.
+const PROBE_TIMEOUT_MS = 45000;
+
 function probeBinary(bin, args, cb) {
-  execFile(bin, args, { timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+  execFile(bin, args, { timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 }, (err, stdout) => {
     cb(!err, (stdout || '').toString().trim().split(/\r?\n/)[0] || '');
   });
 }
+
+function runProbes(cb) {
+  probeBinary(ytDlpPath, ['--version'], (ytOk, ytVersion) => {
+    probeBinary(ffmpegPath, ['-version'], (ffOk, ffVersion) => {
+      const probes = {
+        ytOk,
+        ffOk,
+        ytVersion,
+        ffVersion: ffVersion ? ffVersion.replace(/^ffmpeg version /, '').split(' ')[0] : null
+      };
+      // Cache a healthy result, but let a failure expire almost immediately:
+      // during a cold start the answer is "not yet", not "broken", and pinning
+      // that for a full minute is what keeps users locked out the longest.
+      healthCache = { at: Date.now(), payload: probes, ttl: ytOk && ffOk ? 60000 : 5000 };
+      cb(probes);
+    });
+  });
+}
+
+// Pay the interpreter's first-run cost at boot instead of making the first real
+// visitor wait for it.
+runProbes((p) => console.log(`[boot] yt-dlp=${p.ytOk ? p.ytVersion : 'FAILED'} ffmpeg=${p.ffOk ? p.ffVersion : 'FAILED'}`));
 
 app.get('/api/status', (req, res) => {
   // Only the binary probes are cached -- they cost two process spawns and never
@@ -894,22 +930,11 @@ app.get('/api/status', (req, res) => {
     });
   };
 
-  if (healthCache.payload && Date.now() - healthCache.at < 60000) {
+  if (healthCache.payload && Date.now() - healthCache.at < (healthCache.ttl || 60000)) {
     return respond(healthCache.payload);
   }
 
-  probeBinary(ytDlpPath, ['--version'], (ytOk, ytVersion) => {
-    probeBinary(ffmpegPath, ['-version'], (ffOk, ffVersion) => {
-      const probes = {
-        ytOk,
-        ffOk,
-        ytVersion,
-        ffVersion: ffVersion ? ffVersion.replace(/^ffmpeg version /, '').split(' ')[0] : null
-      };
-      healthCache = { at: Date.now(), payload: probes };
-      respond(probes);
-    });
-  });
+  runProbes(respond);
 });
 
 // YouTube changes constantly, so a yt-dlp binary goes stale within weeks. The

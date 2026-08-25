@@ -185,14 +185,19 @@ document.addEventListener('DOMContentLoaded', () => {
     wakePromise = (async () => {
       while (Date.now() - startedAt < WAKE_BUDGET_MS) {
         try {
-          const s = await pingStatus(30000);
+          const s = await pingStatus(60000);
           if (s.ytDlpAvailable && s.ffmpegAvailable) {
             backendReady = true;
             setBadge('online', 'Ready');
             return true;
           }
-          setBadge('offline', 'Server tools unavailable');
-          return false;
+          // Answering but not yet reporting healthy means the container is still
+          // warming its binaries, not that it is broken. Keep waiting rather
+          // than locking the user out of a server that is seconds from ready.
+          const warming = Math.round((Date.now() - startedAt) / 1000);
+          setBadge('checking', `Starting up… ${warming}s`);
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
         } catch {
           const secs = Math.round((Date.now() - startedAt) / 1000);
           setBadge('checking', `Waking server… ${secs}s`);
