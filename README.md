@@ -16,93 +16,50 @@ A modern, fast, and private YouTube to MP3 / MP4 converter with custom video tri
 - 📊 **Live Progress & SSE**: Real-time conversion percentage and status updates.
 - 💾 **Estimated File Sizes**: Shows real file size estimates for audio and video resolutions before starting the download.
 - 🕒 **Local Download History**: Remembers your recent downloads locally in your browser.
-- 🌐 **GitHub Pages + Cloud Backend Ready**: Host the frontend on GitHub Pages and connect to your free cloud backend (Render/Railway/Docker).
+- 🌐 **GitHub Pages + Your Own Laptop**: Frontend on GitHub Pages, backend on your laptop via Tailscale Funnel — a home IP, which is what keeps YouTube from bot-blocking downloads.
 - 🔒 **Private & Ad-Free**: No third-party ads, no popups, no telemetry, no middleman servers.
 
 ---
 
-## 🌐 Running on GitHub Pages
+## 🌐 How this is hosted
 
-The frontend is live at **https://fawazelayan.github.io/yt-converter/** and needs no setup
-from whoever opens it. Paste a link, pick a format, download. There is no backend URL to
-configure — the page detects that it is running on Pages and points itself at the cloud
-backend automatically.
+The frontend is on **GitHub Pages** (free, always up). The backend — the part that actually
+runs `yt-dlp` and `ffmpeg` — runs **on your own laptop**, published to the internet by
+**Tailscale Funnel**.
 
-1. Repo **Settings → Pages → Source** = **GitHub Actions**.
-2. `.github/workflows/deploy.yml` publishes `public/` on every push to `main`.
+```
+friend's phone  →  fawazelayan.github.io/yt-converter  →  your laptop  →  YouTube
+```
 
-The backend URL lives in one constant, `DEFAULT_CLOUD_BACKEND` at the top of
-`public/app.js`. Change it there if you ever move hosts. (Alt+click the status badge to
-override it just for your own browser — it is deliberately hidden behind a modifier key so
-ordinary visitors never trip over it.)
+**Why not a cloud host?** Because YouTube bot-checks datacenter IP addresses, which is what
+every free cloud host gives you. Running the backend on a home connection is the single
+biggest factor in downloads actually working — far more than which host you pick.
 
----
+### One-time setup
 
-## ☁️ Free Cloud Backend (Render)
+1. **Install Tailscale** on the laptop: <https://tailscale.com/download> — sign in with Google.
+2. **Enable HTTPS + Funnel** once in the [admin console](https://login.tailscale.com/admin/dns):
+   turn on MagicDNS and HTTPS Certificates, then approve Funnel when first prompted.
+3. **Double-click `START-SERVER.bat`.** It starts the server, opens the tunnel, and prints
+   your permanent address, e.g. `https://my-laptop.tail1234.ts.net`.
+4. **Paste that address** into `public/app.js` as `BACKEND_URL` — it is the first constant
+   in the file and clearly marked. Commit and push; GitHub Pages redeploys itself.
 
-Video and audio processing needs Node, `ffmpeg`, and `yt-dlp`, so the backend runs as a
-Docker container on **[Render.com](https://render.com)**'s free plan:
+That address never changes, so step 4 happens exactly once.
 
-1. Sign up on Render → **New + → Web Service** → pick the `yt-converter` repo.
-2. Render detects the `Dockerfile` and builds it with `ffmpeg` + `yt-dlp`.
-3. Leave **Auto-Deploy** on so pushes to `main` redeploy the backend.
-4. Copy the live URL into `DEFAULT_CLOUD_BACKEND` in `public/app.js`.
+### Daily use
 
-### Staying awake (this part matters)
+Double-click **`START-SERVER.bat`** and leave the window open. That's it.
 
-Render's free tier **spins a service down after 15 minutes of inactivity**, and the next
-request then waits ~50 seconds for a cold start. To a normal user that is indistinguishable
-from a broken site.
+- Window open + laptop awake → the site works for anyone, anywhere, on any network.
+- Window closed / laptop asleep → the site says *"The download server is offline"*.
 
-Two things handle it, both free:
+Set the laptop to **not sleep when the lid closes** (Settings → System → Power & battery →
+"When I close the lid" → Do nothing), or it will keep dropping offline.
 
-- **`.github/workflows/keepalive.yml`** pings `/api/status` every 10 minutes **during waking
-  hours only** (05:00–21:59 UTC = 08:00–00:59 local). This is deliberate: Render grants
-  750 free instance hours per *workspace* per month and suspends every free service until
-  the next month once that runs out. A genuinely always-on service burns ~744 h of that, so
-  round-the-clock pinging would leave ~6 h of headroom and eventually get the workspace
-  suspended. The waking-hours schedule uses ~527 h and leaves >200 h spare; the only cost is
-  a one-minute wake-up if someone opens the site overnight.
-- **The frontend waits for the wake-up** instead of failing. The status badge shows
-  `Waking server… 12s` and the request goes through once the backend answers.
+### What your friends need
 
-If you host the backend somewhere else, set a repo variable `BACKEND_URL`
-(**Settings → Secrets and variables → Actions → Variables**) and the keep-alive job will
-use it. Note that GitHub disables scheduled workflows after 60 days with no repo activity —
-if the site ever feels slow again, check that the keep-alive runs are still green, or point
-a free [UptimeRobot](https://uptimerobot.com) monitor at `/api/status` as a backstop.
-
-### Keeping yt-dlp current
-
-YouTube changes its player constantly and a pinned `yt-dlp` breaks within weeks. This is
-handled automatically: `docker-entrypoint.sh` fetches the latest `yt-dlp` on every container
-start (falling back to the baked-in build if the download fails), and `server.js` re-runs
-`yt-dlp -U` every 12 hours so a long-running warm instance does not go stale either.
-
-### What the free tier can actually handle
-
-The free instance is **0.1 CPU / 512 MB**, which is fine for one or two people at a time
-and not much more:
-
-| | Expect |
-|---|---|
-| 1080p MP4, 3½ min video | ~85 MB, ~2 min (stream copy, no re-encode) |
-| 320 kbps MP3, 3½ min video | ~8.5 MB, ~70 s (MP3 encoding is the slow part) |
-| Simultaneous downloads | 2 (`MAX_CONCURRENT_JOBS`) |
-| Bandwidth | ~100 GB/month, so roughly 1,000 HD videos |
-
-Beyond two at once the server returns "busy, try again in a few seconds" rather than
-accepting the work. That cap is deliberate: three concurrent 1080p jobs OOM the instance,
-and the resulting restart truncates *everyone's* in-flight download, not just the extra
-one. Refusing the third request is the much kinder failure.
-
-### If YouTube starts bot-checking the server
-
-Datacenter IPs occasionally get "Sign in to confirm you're not a bot". The server already
-retries across several player clients before giving up. If it persists, add your YouTube
-cookies as a Render environment variable `YOUTUBE_COOKIES` (Netscape `cookies.txt` format);
-`server.js` writes it to disk on startup and passes it to `yt-dlp`. Use a throwaway Google
-account — cookies used from a datacenter IP tend to get burned quickly.
+Nothing. Just the link — no Tailscale account, no app, no setup.
 
 ---
 

@@ -132,19 +132,31 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ---------------------------------------------------------
-  // Server state & API Base (Default: live Render cloud backend)
+  // Server state & API base (the laptop running server.js, via Tailscale Funnel)
   // ---------------------------------------------------------
 
-  const DEFAULT_CLOUD_BACKEND = 'https://yt-converter-backend-hw8r.onrender.com';
+  // ===========================================================
+  // THE ONLY LINE YOU EVER NEED TO CHANGE
+  //
+  // Public HTTPS address of the laptop running server.js, published by
+  // Tailscale Funnel. Looks like: https://my-laptop.tail1234.ts.net
+  // Get it by running:  tailscale funnel status
+  // ===========================================================
+  const BACKEND_URL = 'https://REPLACE-ME.ts.net';
 
+  // The backend runs on a home internet connection rather than a datacenter,
+  // which is the whole point: YouTube bot-checks datacenter IPs and mostly
+  // leaves residential ones alone.
   function getApiBase() {
     const custom = (localStorage.getItem('ytdownloader_backend_url') || '').trim();
     if (custom) return custom.replace(/\/+$/, '');
-    // Automatically use the live Render backend when hosted on GitHub Pages or custom domain
-    if (window.location.hostname.endsWith('github.io') || (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')) {
-      return DEFAULT_CLOUD_BACKEND;
+    // Served by server.js itself (localhost, or over the funnel) -> same origin.
+    if (window.location.hostname === 'localhost' ||
+        window.location.hostname === '127.0.0.1' ||
+        window.location.hostname.endsWith('.ts.net')) {
+      return '';
     }
-    return '';
+    return BACKEND_URL.replace(/\/+$/, '');
   }
 
   function apiUrl(path) {
@@ -153,11 +165,10 @@ document.addEventListener('DOMContentLoaded', () => {
     return `${base}${path}`;
   }
 
-  // The free cloud backend sleeps after ~15 minutes of inactivity and needs up
-  // to a minute to wake up. Left unhandled that looks exactly like a broken
-  // site, so every call that touches the backend waits on wakeBackend() first
-  // and the badge narrates what is happening.
-  const WAKE_BUDGET_MS = 150000;
+  // A laptop backend is either up or it is not -- there is no cold start to wait
+  // out. Retry briefly to ride over a Wi-Fi blip or a tunnel reconnect, then say
+  // plainly that the machine is off rather than spinning forever.
+  const WAKE_BUDGET_MS = 20000;
 
   let backendReady = false;
   let wakePromise = null;
@@ -180,7 +191,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (wakePromise) return wakePromise;
 
     const startedAt = Date.now();
-    setBadge('checking', 'Waking server…');
+    setBadge('checking', 'Connecting…');
 
     wakePromise = (async () => {
       while (Date.now() - startedAt < WAKE_BUDGET_MS) {
@@ -200,11 +211,11 @@ document.addEventListener('DOMContentLoaded', () => {
           continue;
         } catch {
           const secs = Math.round((Date.now() - startedAt) / 1000);
-          setBadge('checking', `Waking server… ${secs}s`);
+          setBadge('checking', `Connecting… ${secs}s`);
           await new Promise((r) => setTimeout(r, 3000));
         }
       }
-      setBadge('offline', 'Server unreachable');
+      setBadge('offline', 'Laptop is offline');
       return false;
     })();
 
@@ -298,7 +309,7 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const awake = await wakeBackend();
       if (!awake) {
-        throw new Error('The server is not responding yet. Give it a few seconds and try again.');
+        throw new Error('The download server is offline. Ask Fawaz to open his laptop.');
       }
       fetchBtnText.textContent = 'Finding…';
 
@@ -746,7 +757,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const awake = await wakeBackend();
       if (!awake) {
         backendReady = false;
-        toast('The server is not responding yet. Give it a few seconds and try again.', 'error');
+        toast('The download server is offline. Ask Fawaz to open his laptop.', 'error');
         return;
       }
 
@@ -789,7 +800,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const awake = await wakeBackend();
       if (!awake) {
         backendReady = false;
-        throw new Error('The server is not responding yet. Give it a few seconds and try again.');
+        throw new Error('The download server is offline. Ask Fawaz to open his laptop.');
       }
 
       const response = await fetch(apiUrl('/api/convert-trim'), {
