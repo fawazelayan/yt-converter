@@ -142,7 +142,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Tailscale Funnel. Looks like: https://my-laptop.tail1234.ts.net
   // Get it by running:  tailscale funnel status
   // ===========================================================
-  const BACKEND_URL = 'https://REPLACE-ME.ts.net';
+  const BACKEND_URL = 'https://desktop-6h27mhs.tail3b4823.ts.net';
 
   // The backend runs on a home internet connection rather than a datacenter,
   // which is the whole point: YouTube bot-checks datacenter IPs and mostly
