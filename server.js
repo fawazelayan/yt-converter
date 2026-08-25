@@ -19,6 +19,23 @@ function getBinaryPath() {
 const ytDlpPath = getBinaryPath();
 const TEMP_DIR = path.join(__dirname, 'downloads_temp');
 
+// Path to cookies file if provided (via file or YOUTUBE_COOKIES env variable)
+const cookiesFilePath = path.join(__dirname, 'cookies.txt');
+if (process.env.YOUTUBE_COOKIES && !fs.existsSync(cookiesFilePath)) {
+  try {
+    fs.writeFileSync(cookiesFilePath, process.env.YOUTUBE_COOKIES, 'utf8');
+  } catch (e) {
+    console.error('Failed to write YOUTUBE_COOKIES env to file:', e.message);
+  }
+}
+
+function getCookiesArgs() {
+  if (fs.existsSync(cookiesFilePath)) {
+    return ['--cookies', cookiesFilePath];
+  }
+  return [];
+}
+
 // Ensure temp directory exists
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -149,6 +166,7 @@ app.post('/api/info', (req, res) => {
     '--no-warnings',
     '--skip-download',
     '--extractor-args', 'youtube:player_client=android,web',
+    ...getCookiesArgs(),
     targetUrl
   ];
 
@@ -327,6 +345,7 @@ app.get('/api/stream-preview', (req, res) => {
     '--no-playlist',
     '--no-warnings',
     '--extractor-args', 'youtube:player_client=android,web',
+    ...getCookiesArgs(),
     '-f', 'best[height<=720][ext=mp4]/best[height<=720]/b/best',
     '-g',
     targetUrl
@@ -334,7 +353,7 @@ app.get('/api/stream-preview', (req, res) => {
 
   execFile(ytDlpPath, args, { timeout: 15000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
-      execFile(ytDlpPath, ['--no-playlist', '--no-warnings', '--extractor-args', 'youtube:player_client=android,web', '-g', targetUrl], { timeout: 15000 }, (fbErr, fbStdout) => {
+      execFile(ytDlpPath, ['--no-playlist', '--no-warnings', '--extractor-args', 'youtube:player_client=android,web', ...getCookiesArgs(), '-g', targetUrl], { timeout: 15000 }, (fbErr, fbStdout) => {
         if (fbErr || !fbStdout.trim()) {
           return res.status(500).send('Could not extract preview stream URL.');
         }
@@ -429,6 +448,7 @@ app.post('/api/convert-trim', (req, res) => {
     '--no-warnings',
     '--newline',
     '--extractor-args', 'youtube:player_client=android,web',
+    ...getCookiesArgs(),
     '--download-sections', `*${startClock}-${endClock}`,
     '--force-keyframes-at-cuts',
   ];
@@ -554,7 +574,8 @@ app.get('/api/download', (req, res) => {
   const ytdlArgs = [
     '--no-playlist',
     '--no-warnings',
-    '--extractor-args', 'youtube:player_client=android,web'
+    '--extractor-args', 'youtube:player_client=android,web',
+    ...getCookiesArgs()
   ];
   if (ffmpegPath) {
     ytdlArgs.push('--ffmpeg-location', ffmpegPath);
