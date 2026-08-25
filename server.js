@@ -338,8 +338,8 @@ app.post('/api/info', (req, res) => {
       }
 
       const audioBitrates = [320, 256, 192, 128].map((kbps) => {
-        const bytes = durationSec * ((kbps * 1000) / 8) + 120000;
-        return { label: `${kbps} kbps`, quality: String(kbps), size: formatFileSize(bytes), bytes: Math.round(bytes) };
+        const bytes = Math.round(durationSec * ((kbps * 1000) / 8));
+        return { label: `${kbps} kbps`, quality: String(kbps), size: formatFileSize(bytes), bytes };
       });
 
       function estimateVideoSize(targetHeight, duration) {
@@ -347,18 +347,34 @@ app.post('/api/info', (req, res) => {
         let matchedAudioFormat = null;
 
         if (Array.isArray(data.formats)) {
-          const videoCandidates = data.formats.filter(f => f.height && f.height <= targetHeight && f.vcodec !== 'none');
+          // Prioritize actual AVC1/MP4 formats that yt-dlp downloads with real filesize
+          const videoCandidates = data.formats.filter(f => f.height && f.height <= targetHeight && f.vcodec && f.vcodec !== 'none');
           if (videoCandidates.length > 0) {
             videoCandidates.sort((a, b) => {
               if (b.height !== a.height) return b.height - a.height;
+              const aHasSize = (a.filesize || a.filesize_approx) ? 1 : 0;
+              const bHasSize = (b.filesize || b.filesize_approx) ? 1 : 0;
+              if (bHasSize !== aHasSize) return bHasSize - aHasSize;
+              const aIsAvc = (a.vcodec && a.vcodec.startsWith('avc1')) ? 1 : 0;
+              const bIsAvc = (b.vcodec && b.vcodec.startsWith('avc1')) ? 1 : 0;
+              if (bIsAvc !== aIsAvc) return bIsAvc - aIsAvc;
               return (b.tbr || b.vbr || 0) - (a.tbr || a.vbr || 0);
             });
             matchedVideoFormat = videoCandidates[0];
           }
 
-          const audioCandidates = data.formats.filter(f => f.acodec && f.acodec !== 'none' && f.vcodec === 'none');
+          // Prioritize standard AAC/M4A audio track
+          const audioCandidates = data.formats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
           if (audioCandidates.length > 0) {
-            audioCandidates.sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0));
+            audioCandidates.sort((a, b) => {
+              const aHasSize = (a.filesize || a.filesize_approx) ? 1 : 0;
+              const bHasSize = (b.filesize || b.filesize_approx) ? 1 : 0;
+              if (bHasSize !== aHasSize) return bHasSize - aHasSize;
+              const aIsAac = (a.acodec && a.acodec.startsWith('mp4a')) ? 1 : 0;
+              const bIsAac = (b.acodec && b.acodec.startsWith('mp4a')) ? 1 : 0;
+              if (bIsAac !== aIsAac) return bIsAac - aIsAac;
+              return (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0);
+            });
             matchedAudioFormat = audioCandidates[0];
           }
         }
@@ -378,21 +394,23 @@ app.post('/api/info', (req, res) => {
 
         if (!videoBytes || videoBytes <= 0) {
           const bitrateMap = {
-            2160: 16000000,
-            1440: 8000000,
-            1080: 3500000,
-            720: 1800000,
-            480: 900000,
-            360: 450000
+            2160: 12000000,
+            1440: 6000000,
+            1080: 2500000,
+            720: 1200000,
+            480: 600000,
+            360: 350000
           };
-          const b = bitrateMap[targetHeight] || 3500000;
+          const b = bitrateMap[targetHeight] || 2500000;
           videoBytes = (duration * b) / 8;
         }
 
         let audioBytes = 0;
         if (matchedVideoFormat && matchedVideoFormat.acodec === 'none') {
-          if (matchedAudioFormat && matchedAudioFormat.filesize) {
+          if (matchedAudioFormat && matchedAudioFormat.filesize && matchedAudioFormat.filesize > 0) {
             audioBytes = matchedAudioFormat.filesize;
+          } else if (matchedAudioFormat && matchedAudioFormat.filesize_approx && matchedAudioFormat.filesize_approx > 0) {
+            audioBytes = matchedAudioFormat.filesize_approx;
           } else if (matchedAudioFormat && (matchedAudioFormat.abr || matchedAudioFormat.tbr)) {
             audioBytes = ((matchedAudioFormat.abr || matchedAudioFormat.tbr || 128) * 1000 / 8) * duration;
           } else {
