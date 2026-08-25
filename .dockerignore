@@ -1,0 +1,29 @@
+# Without this, a local `docker build` copies the Windows yt-dlp.exe and the
+# host's node_modules into a Linux image, which breaks both binaries.
+node_modules
+npm-debug.log*
+yt-dlp.exe
+yt-dlp
+downloads_temp
+cookies.txt
+
+.git
+.github
+.gitignore
+.impeccable
+.vscode
+.idea
+
+*.bat
+*.md
+!README.md
+
+*.mp3
+*.mp4
+*.webm
+*.part
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db

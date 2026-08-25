@@ -9,6 +9,7 @@ downloads_temp/
 *.part
 *.ytdl
 *.tmp
+CLAUDE.md
 
 # Executables
 yt-dlp.exe

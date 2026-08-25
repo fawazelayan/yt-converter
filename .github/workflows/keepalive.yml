@@ -1,0 +1,48 @@
+name: Keep backend awake
+
+# Render's free tier spins a service down after 15 minutes of inactivity, and
+# the next request then pays a ~50 second cold start -- which reads as "the site
+# is broken" to anyone who is not the developer. Pinging every 10 minutes keeps
+# the instance warm around the clock. One always-on free service uses roughly
+# 744 of the 750 free instance hours per month, so this stays inside the plan.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the backend health endpoint
+        run: |
+          BACKEND="${{ vars.BACKEND_URL }}"
+          if [ -z "$BACKEND" ]; then
+            BACKEND="https://yt-converter-backend-hw8r.onrender.com"
+          fi
+          echo "Pinging $BACKEND/api/status"
+
+          # A cold start can take ~50s, so allow a generous timeout and retry
+          # rather than failing the run the moment the instance is still waking.
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/body.json -w "%{http_code}" \
+              --max-time 120 "$BACKEND/api/status") || code=000
+            echo "attempt $attempt -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/body.json
+              echo
+              exit 0
+            fi
+            sleep 15
+          done
+
+          echo "Backend did not return HTTP 200 after 3 attempts."
+          exit 1

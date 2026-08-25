@@ -153,32 +153,84 @@ document.addEventListener('DOMContentLoaded', () => {
     return `${base}${path}`;
   }
 
-  function checkServerStatus() {
-    serverState.dataset.state = 'checking';
-    serverStateText.textContent = 'Connecting';
+  // The free cloud backend sleeps after ~15 minutes of inactivity and needs up
+  // to a minute to wake up. Left unhandled that looks exactly like a broken
+  // site, so every call that touches the backend waits on wakeBackend() first
+  // and the badge narrates what is happening.
+  const WAKE_BUDGET_MS = 150000;
 
-    fetch(apiUrl('/api/status'))
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((s) => {
-        const ready = s.ytDlpAvailable && s.ffmpegAvailable;
-        serverState.dataset.state = ready ? 'online' : 'offline';
-        serverStateText.textContent = ready ? 'Ready' : 'Missing yt-dlp or ffmpeg';
-      })
-      .catch(() => {
-        serverState.dataset.state = 'offline';
-        serverStateText.textContent = 'Server starting…';
-      });
+  let backendReady = false;
+  let wakePromise = null;
+
+  function setBadge(state, text) {
+    serverState.dataset.state = state;
+    serverStateText.textContent = text;
   }
 
-  checkServerStatus();
+  function pingStatus(timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(apiUrl('/api/status'), { signal: controller.signal, cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('unhealthy'))))
+      .finally(() => clearTimeout(timer));
+  }
 
-  // Allow clicking the server status badge to view / customize backend URL
+  function wakeBackend() {
+    if (backendReady) return Promise.resolve(true);
+    if (wakePromise) return wakePromise;
+
+    const startedAt = Date.now();
+    setBadge('checking', 'Waking server…');
+
+    wakePromise = (async () => {
+      while (Date.now() - startedAt < WAKE_BUDGET_MS) {
+        try {
+          const s = await pingStatus(30000);
+          if (s.ytDlpAvailable && s.ffmpegAvailable) {
+            backendReady = true;
+            setBadge('online', 'Ready');
+            return true;
+          }
+          setBadge('offline', 'Server tools unavailable');
+          return false;
+        } catch {
+          const secs = Math.round((Date.now() - startedAt) / 1000);
+          setBadge('checking', `Waking server… ${secs}s`);
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+      }
+      setBadge('offline', 'Server unreachable');
+      return false;
+    })();
+
+    wakePromise.finally(() => { wakePromise = null; });
+    return wakePromise;
+  }
+
+  // Start warming the instance the moment the page opens, so by the time a link
+  // is pasted the server is usually already up.
+  wakeBackend();
+
+  // A tab left open for hours will find the instance asleep again.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !backendReady) wakeBackend();
+  });
+
+  // Plain click just re-checks. The backend override is deliberately tucked
+  // behind Alt/Shift-click so an ordinary user tapping the badge never gets an
+  // unexplained prompt asking for a server URL.
   serverState.style.cursor = 'pointer';
-  serverState.title = 'Click to view or customize backend API URL';
-  serverState.addEventListener('click', () => {
+  serverState.title = 'Click to re-check the server (Alt+click to set a custom backend)';
+  serverState.addEventListener('click', (event) => {
+    if (!event.altKey && !event.shiftKey) {
+      backendReady = false;
+      wakeBackend();
+      return;
+    }
+
     const current = getApiBase();
     const input = prompt(
-      `Backend Server URL (currently: ${current || 'localhost'}):\nLeave blank to reset to default Render cloud backend:`,
+      `Backend Server URL (currently: ${current || 'localhost'}):\nLeave blank to reset to the default cloud backend:`,
       localStorage.getItem('ytdownloader_backend_url') || ''
     );
     if (input !== null) {
@@ -190,7 +242,8 @@ document.addEventListener('DOMContentLoaded', () => {
         localStorage.removeItem('ytdownloader_backend_url');
         toast('Using default cloud backend', 'info');
       }
-      checkServerStatus();
+      backendReady = false;
+      wakeBackend();
     }
   });
 
@@ -235,15 +288,32 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     fetchBtn.disabled = true;
-    fetchBtnText.textContent = 'Finding…';
+    fetchBtnText.textContent = backendReady ? 'Finding…' : 'Waking server…';
 
     try {
-      const response = await fetch(apiUrl('/api/info'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url })
-      });
-      const data = await response.json();
+      const awake = await wakeBackend();
+      if (!awake) {
+        throw new Error('The server is not responding yet. Give it a few seconds and try again.');
+      }
+      fetchBtnText.textContent = 'Finding…';
+
+      // A first extraction on a freshly woken instance can be slow; cap it so a
+      // hung request eventually surfaces as an error instead of spinning forever.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 120000);
+      let response;
+      try {
+        response = await fetch(apiUrl('/api/info'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || 'That link could not be read.');
 
       video = data;
@@ -258,7 +328,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
       result.classList.remove('is-hidden');
     } catch (err) {
-      toast(err.message, 'error');
+      // A failure may well mean the instance went back to sleep, so make the
+      // next attempt re-run the wake handshake.
+      backendReady = false;
+      toast(
+        err.name === 'AbortError'
+          ? 'The server took too long to answer. Please try again.'
+          : err.message,
+        'error'
+      );
     } finally {
       fetchBtn.disabled = false;
       fetchBtnText.textContent = 'Find it';
@@ -649,24 +727,40 @@ document.addEventListener('DOMContentLoaded', () => {
     else startDirectDownload();
   });
 
-  function startDirectDownload() {
+  async function startDirectDownload() {
     const format = currentFormat();
     const { value: quality } = selectedQuality();
     const title = video.title || 'YouTube download';
 
-    const href = apiUrl(
-      `/api/download?url=${encodeURIComponent(video.url)}` +
-      `&format=${format}&quality=${quality}&title=${encodeURIComponent(title)}`
-    );
+    // This hands the URL straight to the browser's downloader, which streams to
+    // disk without buffering the whole file in memory. The catch is that a
+    // failed response is invisible to us, so make sure the backend is actually
+    // awake before handing it over.
+    downloadBtn.disabled = true;
+    try {
+      const awake = await wakeBackend();
+      if (!awake) {
+        backendReady = false;
+        toast('The server is not responding yet. Give it a few seconds and try again.', 'error');
+        return;
+      }
 
-    triggerSave(href, `${title}.${format}`);
-    toast('Your browser is saving the file now.', 'ok');
+      const href = apiUrl(
+        `/api/download?url=${encodeURIComponent(video.url)}` +
+        `&format=${format}&quality=${quality}&title=${encodeURIComponent(title)}`
+      );
 
-    remember({
-      title,
-      kind: format.toUpperCase(),
-      meta: megabytes(estimatedBytes()) || compact(duration)
-    });
+      triggerSave(href, `${title}.${format}`);
+      toast('Your browser is saving the file now.', 'ok');
+
+      remember({
+        title,
+        kind: format.toUpperCase(),
+        meta: megabytes(estimatedBytes()) || compact(duration)
+      });
+    } finally {
+      downloadBtn.disabled = false;
+    }
   }
 
   async function startTrimJob() {
@@ -678,6 +772,12 @@ document.addEventListener('DOMContentLoaded', () => {
     downloadBtn.disabled = true;
 
     try {
+      const awake = await wakeBackend();
+      if (!awake) {
+        backendReady = false;
+        throw new Error('The server is not responding yet. Give it a few seconds and try again.');
+      }
+
       const response = await fetch(apiUrl('/api/convert-trim'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

@@ -1,0 +1,8 @@
+# This repo is edited on Windows but the backend runs in a Linux container.
+# A shell script committed with CRLF endings fails at exec time with a confusing
+# "no such file or directory", so pin every script to LF.
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.bat text eol=crlf
+yt-dlp.exe binary

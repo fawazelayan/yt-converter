@@ -3,7 +3,22 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
+
+// Resolve ffmpeg. Inside the Alpine container the distro build (installed via
+// apk) is the safest choice; ffmpeg-static is the fallback for local dev.
+function resolveFfmpegPath() {
+  const explicit = process.env.FFMPEG_PATH;
+  if (explicit && fs.existsSync(explicit)) return explicit;
+  for (const p of ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']) {
+    if (fs.existsSync(p)) return p;
+  }
+  try {
+    const bundled = require('ffmpeg-static');
+    if (bundled && fs.existsSync(bundled)) return bundled;
+  } catch (e) {}
+  return 'ffmpeg';
+}
+const ffmpegPath = resolveFfmpegPath();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,6 +49,87 @@ function getCookiesArgs() {
     return ['--cookies', cookiesFilePath];
   }
   return [];
+}
+
+// ---------------------------------------------------------------------------
+// YouTube extraction strategy
+//
+// Two things decide whether extraction works and at what quality:
+//
+// 1. A JavaScript runtime. Modern yt-dlp needs one to solve YouTube's
+//    signature/nsig challenges. Without it formats silently vanish and
+//    downloads get throttled. We already ship Node, so Node is the runtime --
+//    but only pass the flag if this yt-dlp build understands it.
+//
+// 2. The player client. Pinning "android" dodges bot checks but caps every
+//    video at 360p, so it is the last resort, not the default. We walk the
+//    chain in order and keep the first client that actually returns data.
+// ---------------------------------------------------------------------------
+const CLIENT_CHAIN = (process.env.YTDLP_CLIENTS || 'default|web_safari,mweb|android,web')
+  .split('|')
+  .map((c) => c.trim())
+  .filter(Boolean);
+
+let jsRuntimeArgs = [];
+(function detectJsRuntimeSupport() {
+  if (process.env.YTDLP_JS_RUNTIME === 'off') return;
+  execFile(ytDlpPath, ['--help'], { maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+    if (err || !stdout || !stdout.includes('--js-runtimes')) {
+      console.log('[yt-dlp] --js-runtimes not supported by this build, skipping');
+      return;
+    }
+    jsRuntimeArgs = ['--js-runtimes', process.env.YTDLP_JS_RUNTIME || 'node'];
+    console.log('[yt-dlp] using JS runtime:', jsRuntimeArgs[1]);
+  });
+})();
+
+// Args shared by every yt-dlp invocation, for one client strategy.
+function buildBaseArgs(client) {
+  const args = [
+    '--no-playlist',
+    '--no-warnings',
+    '--socket-timeout', '20',
+    '--retries', '5',
+    '--fragment-retries', '5',
+    '--extractor-retries', '3',
+    ...jsRuntimeArgs,
+    ...getCookiesArgs()
+  ];
+  if (client && client !== 'default') {
+    args.push('--extractor-args', `youtube:player_client=${client}`);
+  }
+  return args;
+}
+
+// Translate a raw yt-dlp stderr blob into something a non-technical user can act on.
+function describeYtDlpError(stderr) {
+  const s = (stderr || '').toString();
+  if (/Sign in to confirm|not a bot/i.test(s)) {
+    return 'YouTube is rate-limiting this server right now. Please wait a minute and try again.';
+  }
+  if (/Private video/i.test(s)) return 'This video is private and cannot be downloaded.';
+  if (/Video unavailable|removed by the uploader/i.test(s)) return 'This video is unavailable or has been removed.';
+  if (/age-restricted|confirm your age/i.test(s)) return 'This video is age-restricted, so it cannot be downloaded.';
+  if (/live event will begin|is live/i.test(s)) return 'This is a live stream. Wait until it ends, then try again.';
+  if (/is not a valid URL|Unsupported URL/i.test(s)) return 'That does not look like a valid YouTube link.';
+  return 'Could not read this video. Make sure it is public and the link is correct.';
+}
+
+// Run yt-dlp, walking the client chain until one returns usable output.
+function runYtDlpWithFallback(makeArgs, execOpts, done) {
+  let lastStderr = '';
+  const attempt = (i) => {
+    if (i >= CLIENT_CHAIN.length) return done(new Error('all player clients failed'), '', lastStderr, null);
+    const client = CLIENT_CHAIN[i];
+    execFile(ytDlpPath, makeArgs(client), execOpts, (err, stdout, stderr) => {
+      if (!err && stdout && stdout.trim()) return done(null, stdout, stderr, client);
+      lastStderr = stderr || (err && err.message) || lastStderr;
+      const tail = String(lastStderr).trim().slice(-200);
+      console.warn(`[yt-dlp] client "${client}" failed: ${tail}`);
+      attempt(i + 1);
+    });
+  };
+  attempt(0);
 }
 
 // Ensure temp directory exists
@@ -160,25 +256,19 @@ app.post('/api/info', (req, res) => {
   const videoId = extractVideoId(cleanUrl);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : cleanUrl;
 
-  const args = [
+  const makeArgs = (client) => [
+    ...buildBaseArgs(client),
     '--dump-single-json',
-    '--no-playlist',
-    '--no-warnings',
     '--skip-download',
-    '--extractor-args', 'youtube:player_client=android,web',
-    ...getCookiesArgs(),
     targetUrl
   ];
 
-  execFile(ytDlpPath, args, { maxBuffer: 25 * 1024 * 1024 }, (err, stdout, stderr) => {
+  runYtDlpWithFallback(makeArgs, { maxBuffer: 64 * 1024 * 1024, timeout: 90000 }, (err, stdout, stderr, client) => {
     if (err) {
-      console.error('yt-dlp info error:', stderr || err.message);
-      let userMsg = 'Could not find this video. Please make sure the video is public and the URL is correct.';
-      if ((stderr || '').includes('Private video')) userMsg = 'This video is private and cannot be downloaded.';
-      if ((stderr || '').includes('Video unavailable')) userMsg = 'This video is unavailable or has been removed.';
-      if ((stderr || '').includes('is not a valid URL')) userMsg = 'Invalid YouTube URL provided.';
-      return res.status(400).json({ error: userMsg, details: stderr || err.message });
+      console.error('yt-dlp info error:', stderr);
+      return res.status(400).json({ error: describeYtDlpError(stderr) });
     }
+    console.log(`[info] resolved via player client "${client}"`);
 
     try {
       const data = JSON.parse(stdout);
@@ -341,32 +431,17 @@ app.get('/api/stream-preview', (req, res) => {
   const videoId = extractVideoId(url);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
 
-  const args = [
-    '--no-playlist',
-    '--no-warnings',
-    '--extractor-args', 'youtube:player_client=android,web',
-    ...getCookiesArgs(),
+  const makeArgs = (client) => [
+    ...buildBaseArgs(client),
     '-f', 'best[height<=720][ext=mp4]/best[height<=720]/b/best',
     '-g',
     targetUrl
   ];
 
-  execFile(ytDlpPath, args, { timeout: 15000 }, (err, stdout) => {
-    if (err || !stdout.trim()) {
-      execFile(ytDlpPath, ['--no-playlist', '--no-warnings', '--extractor-args', 'youtube:player_client=android,web', ...getCookiesArgs(), '-g', targetUrl], { timeout: 15000 }, (fbErr, fbStdout) => {
-        if (fbErr || !fbStdout.trim()) {
-          return res.status(500).send('Could not extract preview stream URL.');
-        }
-        const directUrl = fbStdout.trim().split('\n')[0];
-        if (directUrl) return res.redirect(directUrl);
-        res.status(404).send('Preview stream not found.');
-      });
-      return;
-    }
-    const directUrl = stdout.trim().split('\n')[0];
-    if (directUrl) {
-      return res.redirect(directUrl);
-    }
+  runYtDlpWithFallback(makeArgs, { timeout: 30000 }, (err, stdout) => {
+    if (err) return res.status(502).send('Could not extract preview stream URL.');
+    const directUrl = stdout.trim().split(/\r?\n/)[0];
+    if (directUrl) return res.redirect(directUrl);
     res.status(404).send('Preview stream not found.');
   });
 });
@@ -444,11 +519,8 @@ app.post('/api/convert-trim', (req, res) => {
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
 
   const ytdlArgs = [
-    '--no-playlist',
-    '--no-warnings',
+    ...buildBaseArgs(CLIENT_CHAIN[0]),
     '--newline',
-    '--extractor-args', 'youtube:player_client=android,web',
-    ...getCookiesArgs(),
     '--download-sections', `*${startClock}-${endClock}`,
     '--force-keyframes-at-cuts',
   ];
@@ -562,87 +634,132 @@ app.get('/api/download', (req, res) => {
     return res.status(400).send('Please provide a valid YouTube link.');
   }
 
+  const cleanUrl = url.trim();
   const videoId = extractVideoId(cleanUrl);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : cleanUrl;
   const isMp3 = String(format).toLowerCase() === 'mp3';
   const ext = isMp3 ? 'mp3' : 'mp4';
   const rawTitle = title || 'YouTube_Download';
 
-  res.setHeader('Content-Disposition', getSafeFilenameHeader(rawTitle, ext));
-  res.setHeader('Content-Type', isMp3 ? 'audio/mpeg' : 'video/mp4');
+  // Response headers are deliberately NOT set yet. This is a browser-initiated
+  // navigation, so once a byte goes out we are committed to that response and
+  // can no longer fall back to another player client. We hold the headers until
+  // ffmpeg produces real output, which lets a failed attempt retry silently.
+  let clientAborted = false;
+  req.on('close', () => { clientAborted = true; });
 
-  const ytdlArgs = [
-    '--no-playlist',
-    '--no-warnings',
-    '--extractor-args', 'youtube:player_client=android,web',
-    ...getCookiesArgs()
-  ];
-  if (ffmpegPath) {
-    ytdlArgs.push('--ffmpeg-location', ffmpegPath);
-  }
-  let ffmpegArgs;
+  const attempt = (index) => {
+    if (clientAborted) return;
 
-  if (isMp3) {
-    const bitrate = String(quality).replace(/\D/g, '') || '320';
-    ytdlArgs.push('-f', 'bestaudio/best');
-    ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
-      '-vn', '-c:a', 'libmp3lame', '-b:a', `${bitrate}k`, '-f', 'mp3', 'pipe:1'];
-  } else {
-    const heightVal = parseInt(quality, 10);
-    const cap = !isNaN(heightVal) && heightVal > 0 ? `[height<=?${heightVal}]` : '';
-    ytdlArgs.push(
-      '-f', `bestvideo${cap}[vcodec^=avc1][protocol^=http]+bestaudio[acodec^=mp4a][protocol^=http]/bestvideo${cap}[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best${cap}[vcodec^=avc1]/best${cap}[ext=mp4]/best`
-    );
-    ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
-      '-c', 'copy',
-      '-bsf:a', 'aac_adtstoasc',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-      '-f', 'mp4', 'pipe:1'];
-  }
-
-  ytdlArgs.push('-o', '-', targetUrl);
-
-  console.log(`Direct download "${rawTitle}" (${ext}):`, ytdlArgs.join(' '));
-
-  const dlProc = spawn(ytDlpPath, ytdlArgs);
-  const ffProc = spawn(ffmpegPath, ffmpegArgs);
-
-  dlProc.stdout.pipe(ffProc.stdin);
-  ffProc.stdout.pipe(res);
-
-  dlProc.stderr.on('data', (c) => console.log('[direct yt-dlp]:', c.toString().trim()));
-  ffProc.stderr.on('data', (c) => console.log('[direct ffmpeg]:', c.toString().trim()));
-
-  dlProc.stdin.on('error', () => {});
-  ffProc.stdin.on('error', () => {});
-
-  const stop = () => {
-    for (const proc of [dlProc, ffProc]) {
-      if (proc && !proc.killed) {
-        try {
-          proc.kill('SIGTERM');
-        } catch (e) {}
+    if (index >= CLIENT_CHAIN.length) {
+      console.error(`Direct download failed for "${rawTitle}" on every player client`);
+      if (!res.headersSent) {
+        res.status(502).send('Could not download this video right now. Please wait a minute and try again.');
+      } else {
+        res.end();
       }
+      return;
     }
+
+    const client = CLIENT_CHAIN[index];
+    const ytdlArgs = [...buildBaseArgs(client)];
+    if (ffmpegPath) {
+      ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+    }
+    let ffmpegArgs;
+
+    if (isMp3) {
+      const bitrate = String(quality).replace(/\D/g, '') || '320';
+      ytdlArgs.push('-f', 'bestaudio/best');
+      ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+        '-vn', '-c:a', 'libmp3lame', '-b:a', `${bitrate}k`, '-f', 'mp3', 'pipe:1'];
+    } else {
+      const heightVal = parseInt(quality, 10);
+      const cap = !isNaN(heightVal) && heightVal > 0 ? `[height<=?${heightVal}]` : '';
+      ytdlArgs.push(
+        '-f', `bestvideo${cap}[vcodec^=avc1][protocol^=http]+bestaudio[acodec^=mp4a][protocol^=http]/bestvideo${cap}[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best${cap}[vcodec^=avc1]/best${cap}[ext=mp4]/best`
+      );
+      ffmpegArgs = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4', 'pipe:1'];
+    }
+
+    ytdlArgs.push('-o', '-', targetUrl);
+
+    console.log(`Direct download "${rawTitle}" (${ext}) via client "${client}"`);
+
+    const dlProc = spawn(ytDlpPath, ytdlArgs);
+    const ffProc = spawn(ffmpegPath, ffmpegArgs);
+
+    let streaming = false;
+    let settled = false;
+    let lastError = '';
+
+    const stop = () => {
+      for (const proc of [dlProc, ffProc]) {
+        if (proc && !proc.killed) {
+          try { proc.kill('SIGKILL'); } catch (e) {}
+        }
+      }
+    };
+
+    // Called once per attempt, whichever way it ends.
+    const settle = (ok) => {
+      if (settled) return;
+      settled = true;
+      stop();
+      if (clientAborted) return;
+      if (ok || streaming) {
+        res.end();
+      } else {
+        console.warn(`[download] client "${client}" produced no data: ${lastError.slice(-200)}`);
+        attempt(index + 1);
+      }
+    };
+
+    dlProc.stdout.pipe(ffProc.stdin);
+
+    // The moment ffmpeg emits its first byte we know the pipeline is healthy,
+    // so commit the headers and stream the rest straight through.
+    ffProc.stdout.once('data', (first) => {
+      if (clientAborted) return;
+      streaming = true;
+      res.setHeader('Content-Disposition', getSafeFilenameHeader(rawTitle, ext));
+      res.setHeader('Content-Type', isMp3 ? 'audio/mpeg' : 'video/mp4');
+      res.setHeader('Cache-Control', 'no-store');
+      res.write(first);
+      ffProc.stdout.pipe(res, { end: false });
+    });
+
+    dlProc.stderr.on('data', (c) => {
+      const text = c.toString();
+      lastError += text;
+      console.log('[direct yt-dlp]:', text.trim());
+    });
+    ffProc.stderr.on('data', (c) => {
+      const text = c.toString();
+      lastError += text;
+      console.log('[direct ffmpeg]:', text.trim());
+    });
+
+    dlProc.stdin.on('error', () => {});
+    ffProc.stdin.on('error', () => {});
+    dlProc.stdout.on('error', () => {});
+
+    dlProc.on('error', (err) => { lastError += `yt-dlp spawn: ${err.message}`; settle(false); });
+    ffProc.on('error', (err) => { lastError += `ffmpeg spawn: ${err.message}`; settle(false); });
+
+    ffProc.on('close', (code) => {
+      console.log(`Direct download attempt finished (ffmpeg exit ${code}, streamed=${streaming})`);
+      settle(code === 0 && streaming);
+    });
+
+    req.on('close', () => { stop(); });
   };
 
-  const fail = (message) => {
-    console.error('Direct download error:', message);
-    stop();
-    if (!res.headersSent) res.status(500).send('Could not complete this download.');
-    else res.end();
-  };
-
-  dlProc.on('error', (err) => fail(`yt-dlp: ${err.message}`));
-  ffProc.on('error', (err) => fail(`ffmpeg: ${err.message}`));
-
-  ffProc.on('close', (code) => {
-    console.log(`Direct download finished (ffmpeg exit ${code})`);
-    stop();
-    res.end();
-  });
-
-  req.on('close', stop);
+  attempt(0);
 });
 
 // Endpoint: Download the converted file by jobId
@@ -682,26 +799,57 @@ app.get('/api/download/:jobId', (req, res) => {
 });
 
 // Endpoint: Health status
+// Probe both binaries by actually running them. Checking only that a file
+// exists reports "healthy" for a binary that cannot execute, which is exactly
+// the failure this endpoint exists to catch. Results are cached so the
+// keep-alive ping stays cheap.
+let healthCache = { at: 0, payload: null };
+
+function probeBinary(bin, args, cb) {
+  execFile(bin, args, { timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    cb(!err, (stdout || '').toString().trim().split(/\r?\n/)[0] || '');
+  });
+}
+
 app.get('/api/status', (req, res) => {
-  let ytDlpAvailable = false;
-  if (fs.existsSync(ytDlpPath)) {
-    ytDlpAvailable = true;
-  } else {
-    try {
-      const { execFileSync } = require('child_process');
-      execFileSync(ytDlpPath, ['--version'], { stdio: 'ignore' });
-      ytDlpAvailable = true;
-    } catch (e) {
-      ytDlpAvailable = false;
-    }
+  const now = Date.now();
+  if (healthCache.payload && now - healthCache.at < 60000) {
+    return res.json(healthCache.payload);
   }
 
-  res.json({
-    status: 'online',
-    ytDlpAvailable,
-    ffmpegAvailable: !!ffmpegPath && fs.existsSync(ffmpegPath)
+  probeBinary(ytDlpPath, ['--version'], (ytOk, ytVersion) => {
+    probeBinary(ffmpegPath, ['-version'], (ffOk, ffVersion) => {
+      const payload = {
+        status: 'online',
+        ytDlpAvailable: ytOk,
+        ffmpegAvailable: ffOk,
+        ytDlpVersion: ytVersion || null,
+        ffmpegVersion: ffVersion ? ffVersion.replace(/^ffmpeg version /, '').split(' ')[0] : null,
+        jsRuntime: jsRuntimeArgs.length ? jsRuntimeArgs[1] : null,
+        cookies: fs.existsSync(cookiesFilePath),
+        clients: CLIENT_CHAIN,
+        uptime: Math.round(process.uptime())
+      };
+      healthCache = { at: Date.now(), payload };
+      res.json(payload);
+    });
   });
 });
+
+// YouTube changes constantly, so a yt-dlp binary goes stale within weeks. The
+// container refreshes it at boot, but the keep-alive ping means it may never
+// cold-start again, so refresh on a timer too rather than relying on deploys.
+function refreshYtDlp() {
+  if (process.env.YTDLP_AUTO_UPDATE === '0') return;
+  if (process.platform === 'win32') return; // local dev: the bundled .exe is yours to manage
+  execFile(ytDlpPath, ['-U'], { timeout: 180000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const out = `${stdout || ''}${stderr || ''}`.trim().slice(-200);
+    if (err) console.warn('[yt-dlp] self-update skipped:', out || err.message);
+    else console.log('[yt-dlp] self-update:', out);
+    healthCache = { at: 0, payload: null };
+  });
+}
+setInterval(refreshYtDlp, 12 * 60 * 60 * 1000);
 
 // Start listening
 app.listen(PORT, () => {
