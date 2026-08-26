@@ -347,34 +347,29 @@ app.post('/api/info', (req, res) => {
         let matchedAudioFormat = null;
 
         if (Array.isArray(data.formats)) {
-          // Prioritize actual AVC1/MP4 formats that yt-dlp downloads with real filesize
+          // Select video stream matching yt-dlp's actual download ranking
           const videoCandidates = data.formats.filter(f => f.height && f.height <= targetHeight && f.vcodec && f.vcodec !== 'none');
           if (videoCandidates.length > 0) {
             videoCandidates.sort((a, b) => {
               if (b.height !== a.height) return b.height - a.height;
-              const aHasSize = (a.filesize || a.filesize_approx) ? 1 : 0;
-              const bHasSize = (b.filesize || b.filesize_approx) ? 1 : 0;
-              if (bHasSize !== aHasSize) return bHasSize - aHasSize;
-              const aIsAvc = (a.vcodec && a.vcodec.startsWith('avc1')) ? 1 : 0;
-              const bIsAvc = (b.vcodec && b.vcodec.startsWith('avc1')) ? 1 : 0;
-              if (bIsAvc !== aIsAvc) return bIsAvc - aIsAvc;
+              if ((b.fps || 0) !== (a.fps || 0)) return (b.fps || 0) - (a.fps || 0);
+              const codecRank = (c) => {
+                const s = String(c || '').toLowerCase();
+                if (s.startsWith('av01') || s.startsWith('av1')) return 3;
+                if (s.startsWith('vp09') || s.startsWith('vp9')) return 2;
+                return 1;
+              };
+              const rDiff = codecRank(b.vcodec) - codecRank(a.vcodec);
+              if (rDiff !== 0) return rDiff;
               return (b.tbr || b.vbr || 0) - (a.tbr || a.vbr || 0);
             });
             matchedVideoFormat = videoCandidates[0];
           }
 
-          // Prioritize standard AAC/M4A audio track
+          // Select audio stream matching yt-dlp's actual download ranking
           const audioCandidates = data.formats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
           if (audioCandidates.length > 0) {
-            audioCandidates.sort((a, b) => {
-              const aHasSize = (a.filesize || a.filesize_approx) ? 1 : 0;
-              const bHasSize = (b.filesize || b.filesize_approx) ? 1 : 0;
-              if (bHasSize !== aHasSize) return bHasSize - aHasSize;
-              const aIsAac = (a.acodec && a.acodec.startsWith('mp4a')) ? 1 : 0;
-              const bIsAac = (b.acodec && b.acodec.startsWith('mp4a')) ? 1 : 0;
-              if (bIsAac !== aIsAac) return bIsAac - aIsAac;
-              return (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0);
-            });
+            audioCandidates.sort((x, y) => (y.abr || y.tbr || 0) - (x.abr || x.tbr || 0));
             matchedAudioFormat = audioCandidates[0];
           }
         }
@@ -394,14 +389,14 @@ app.post('/api/info', (req, res) => {
 
         if (!videoBytes || videoBytes <= 0) {
           const bitrateMap = {
-            2160: 12000000,
-            1440: 6000000,
-            1080: 2500000,
+            2160: 8000000,
+            1440: 4500000,
+            1080: 2200000,
             720: 1200000,
             480: 600000,
             360: 350000
           };
-          const b = bitrateMap[targetHeight] || 2500000;
+          const b = bitrateMap[targetHeight] || 2200000;
           videoBytes = (duration * b) / 8;
         }
 
@@ -412,7 +407,7 @@ app.post('/api/info', (req, res) => {
           } else if (matchedAudioFormat && matchedAudioFormat.filesize_approx && matchedAudioFormat.filesize_approx > 0) {
             audioBytes = matchedAudioFormat.filesize_approx;
           } else if (matchedAudioFormat && (matchedAudioFormat.abr || matchedAudioFormat.tbr)) {
-            audioBytes = ((matchedAudioFormat.abr || matchedAudioFormat.tbr || 128) * 1000 / 8) * duration;
+            audioBytes = ((matchedAudioFormat.abr || matchedAudioFormat.tbr) * 1000 / 8) * duration;
           } else {
             audioBytes = duration * (128000 / 8);
           }
@@ -432,6 +427,8 @@ app.post('/api/info', (req, res) => {
       };
 
       const standardResolutions = [
+        buildResolution(2160, '4K (Ultra HD)'),
+        buildResolution(1440, '2K (Quad HD)'),
         buildResolution(1080, '1080p (Full HD)'),
         buildResolution(720, '720p (HD)'),
         buildResolution(480, '480p (SD)'),
@@ -439,9 +436,7 @@ app.post('/api/info', (req, res) => {
       ];
 
       const tallest = availableHeights.size ? Math.max(...availableHeights) : 1080;
-      const ceiling = Math.min(1080, tallest);
-
-      let supportedResolutions = standardResolutions.filter(r => r.height <= ceiling);
+      let supportedResolutions = standardResolutions.filter(r => r.height <= tallest);
 
       if (supportedResolutions.length === 0) {
         supportedResolutions = [buildResolution(tallest, `${tallest}p`)];

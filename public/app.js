@@ -382,19 +382,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!video) return;
     const isAudio = currentFormat() === 'mp3';
     const options = isAudio ? video.audio_qualities || [] : video.resolutions || [];
-    const preferred = isAudio ? '320' : '1080';
+    const has1080 = options.some(o => o.quality === '1080');
+    const preferred = isAudio ? '320' : (has1080 ? '1080' : (options[0] ? options[0].quality : '720'));
 
     qualityChips.innerHTML = options
       .map((item) => {
         const bytes = item.rawBytes || item.bytes || 0;
-        const tag = item.quality === preferred ? '<span class="chip-tag">Best pick</span>' : '';
+        const tag = item.quality === preferred ? '<span class="chip-tag">Best</span>' : '';
         return `
           <label class="chip">
             <input type="radio" name="quality" value="${item.quality}" data-bytes="${bytes}" ${
           item.quality === preferred ? 'checked' : ''
         } />
-            ${tag}
-            <span class="chip-title">${item.label}</span>
+            <div class="chip-header">
+              <span class="chip-title">${item.label}</span>
+              ${tag}
+            </div>
             <span class="chip-size mono">${item.size || ''}</span>
           </label>`;
       })
