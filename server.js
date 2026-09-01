@@ -276,6 +276,20 @@ function sendJobEvent(jobId, data) {
   }
 }
 
+// Helper: Clean up partial or completed temp files for a job
+function cleanupJobTempFiles(jobId) {
+  try {
+    const files = fs.readdirSync(TEMP_DIR);
+    for (const f of files) {
+      if (f.startsWith(jobId)) {
+        try {
+          fs.unlinkSync(path.join(TEMP_DIR, f));
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+}
+
 // Helper: Extract YouTube video ID
 function extractVideoId(url) {
   const match = url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^"&?\/\s]{11})/i);
@@ -590,75 +604,6 @@ app.post('/api/convert-trim', (req, res) => {
   const videoId = extractVideoId(url);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
 
-  const ytdlArgs = [
-    ...buildBaseArgs(CLIENT_CHAIN[0]),
-    '--newline',
-    '--concurrent-fragments', '5',
-    '--download-sections', `*${startClock}-${endClock}`,
-    '--force-keyframes-at-cuts',
-  ];
-  if (ffmpegPath) {
-    ytdlArgs.push('--ffmpeg-location', ffmpegPath);
-  }
-
-  if (isAudio) {
-    const audioBitrate = String(quality).replace(/\D/g, '') || '320';
-    ytdlArgs.push(
-      '-f', 'bestaudio/best',
-      '-x',
-      '--audio-format', 'mp3',
-      '--audio-quality', `${audioBitrate}k`,
-      '-o', finalOutputFile
-    );
-  } else {
-    ytdlArgs.push(
-      '-f', `bestvideo[height<=?${heightVal}]+bestaudio/best[height<=?${heightVal}]/best`,
-      '--merge-output-format', 'mp4',
-      '-o', finalOutputFile
-    );
-  }
-
-  ytdlArgs.push(targetUrl);
-
-  console.log(`[Job ${jobId}] Starting Clip Download (${startClock} to ${endClock}):`, ytdlArgs.join(' '));
-  const dlProc = spawn(ytDlpPath, ytdlArgs);
-
-  dlProc.stdout.on('data', (chunk) => {
-    for (const line of chunk.toString().split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const dlMatch = trimmed.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
-      if (dlMatch) {
-        const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
-        jobData.lastStatus = {
-          status: 'downloading',
-          percent,
-          text: `Downloading ${qualityLabel} clip: ${percent}%`
-        };
-        sendJobEvent(jobId, jobData.lastStatus);
-      }
-    }
-  });
-
-  // Track FFmpeg time progress from stderr during section extraction
-  dlProc.stderr.on('data', (chunk) => {
-    const str = chunk.toString();
-    const timeMatch = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
-    if (timeMatch && clipSeconds > 0) {
-      const curSec = parseInt(timeMatch[1], 10) * 3600 + parseInt(timeMatch[2], 10) * 60 + parseFloat(timeMatch[3]);
-      const percent = Math.min(99, Math.max(5, Math.round((curSec / clipSeconds) * 100)));
-      jobData.lastStatus = {
-        status: 'downloading',
-        percent,
-        text: `Processing ${qualityLabel} clip: ${percent}% (${Math.round(curSec)}s / ${clipSeconds}s)`
-      };
-      sendJobEvent(jobId, jobData.lastStatus);
-    }
-  });
-
-  // A failed spawn emits both 'error' and 'close', so release through a latch
-  // rather than from each handler -- double-releasing would inflate the free
-  // slot count and defeat the concurrency cap.
   let slotFreed = false;
   const freeSlot = () => {
     if (slotFreed) return;
@@ -666,49 +611,154 @@ app.post('/api/convert-trim', (req, res) => {
     releaseJobSlot();
   };
 
-  dlProc.on('error', (err) => {
-    console.error(`[Job ${jobId}] yt-dlp spawn error:`, err);
-    freeSlot();
-    jobData.lastStatus = { status: 'error', message: 'Could not start the clip download.' };
-    sendJobEvent(jobId, jobData.lastStatus);
-  });
+  let lastStderr = '';
 
-  dlProc.on('close', (dlCode) => {
-    freeSlot();
-    // Check if yt-dlp saved under the expected or part filename
-    let finalFile = fs.existsSync(finalOutputFile) ? finalOutputFile : null;
-    if (!finalFile) {
-      const stray = fs.readdirSync(TEMP_DIR).find((f) => f.startsWith(jobId) && !f.endsWith('.part'));
-      if (stray) finalFile = path.join(TEMP_DIR, stray);
-    }
-
-    if (dlCode !== 0 || !finalFile || !fs.existsSync(finalFile)) {
-      console.error(`[Job ${jobId}] Clip download failed with code ${dlCode}`);
+  const attempt = (clientIndex) => {
+    if (clientIndex >= CLIENT_CHAIN.length) {
+      freeSlot();
+      cleanupJobTempFiles(jobId);
+      const tail = lastStderr.trim().slice(-500);
+      console.error(`[Job ${jobId}] All player clients failed. Last stderr: ${tail}`);
       jobData.lastStatus = {
         status: 'error',
-        message: 'Could not complete the clip extraction. Check your connection and try again.'
+        message: 'Could not complete the clip extraction. Check your connection and try again.',
+        details: tail || undefined
       };
       sendJobEvent(jobId, jobData.lastStatus);
       return;
     }
 
-    const stat = fs.statSync(finalFile);
-    const size = formatFileSize(stat.size);
+    const client = CLIENT_CHAIN[clientIndex];
+    const ytdlArgs = [
+      ...buildBaseArgs(client),
+      '--newline',
+      '--concurrent-fragments', '5',
+      '--download-sections', `*${startClock}-${endClock}`,
+      '--force-keyframes-at-cuts',
+    ];
+    if (ffmpegPath) {
+      ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+    }
 
-    jobData.fileName = `${jobId}.${ext}`;
-    jobData.filePath = finalFile;
-    jobData.fileSize = size;
-    jobData.lastStatus = {
-      status: 'completed',
-      percent: 100,
-      jobId,
-      fileName: `${jobId}.${ext}`,
-      size,
-      downloadUrl: `/api/download/${jobId}?title=${encodeURIComponent(title || 'Clip')}`,
-      text: `Clip ready · ${size}`
+    if (isAudio) {
+      const audioBitrate = String(quality).replace(/\D/g, '') || '320';
+      ytdlArgs.push(
+        '-f', 'bestaudio/best',
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', `${audioBitrate}k`,
+        '-o', finalOutputFile
+      );
+    } else {
+      ytdlArgs.push(
+        '-f', `bestvideo[height<=?${heightVal}]+bestaudio/best[height<=?${heightVal}]/best`,
+        '--merge-output-format', 'mp4',
+        '-o', finalOutputFile
+      );
+    }
+
+    ytdlArgs.push(targetUrl);
+
+    console.log(`[Job ${jobId}] Starting Clip Download attempt ${clientIndex + 1}/${CLIENT_CHAIN.length} (client: "${client}", ${startClock} to ${endClock}):`, ytdlArgs.join(' '));
+
+    let attemptStderr = '';
+    let attemptSettled = false;
+    const dlProc = spawn(ytDlpPath, ytdlArgs);
+
+    dlProc.stdout.on('data', (chunk) => {
+      for (const line of chunk.toString().split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const dlMatch = trimmed.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+        if (dlMatch) {
+          const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
+          jobData.lastStatus = {
+            status: 'downloading',
+            percent,
+            text: `Downloading ${qualityLabel} clip: ${percent}%`
+          };
+          sendJobEvent(jobId, jobData.lastStatus);
+        }
+      }
+    });
+
+    // Track FFmpeg time progress from stderr during section extraction
+    dlProc.stderr.on('data', (chunk) => {
+      const str = chunk.toString();
+      attemptStderr += str;
+      const timeMatch = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+      if (timeMatch && clipSeconds > 0) {
+        const curSec = parseInt(timeMatch[1], 10) * 3600 + parseInt(timeMatch[2], 10) * 60 + parseFloat(timeMatch[3]);
+        const percent = Math.min(99, Math.max(5, Math.round((curSec / clipSeconds) * 100)));
+        jobData.lastStatus = {
+          status: 'downloading',
+          percent,
+          text: `Processing ${qualityLabel} clip: ${percent}% (${Math.round(curSec)}s / ${clipSeconds}s)`
+        };
+        sendJobEvent(jobId, jobData.lastStatus);
+      }
+    });
+
+    const handleAttemptEnd = (dlCode, err) => {
+      if (attemptSettled) return;
+      attemptSettled = true;
+
+      if (err) {
+        attemptStderr += `\n[spawn error] ${err.message || err}`;
+      }
+
+      // Check if yt-dlp saved under the expected or part filename
+      let finalFile = fs.existsSync(finalOutputFile) ? finalOutputFile : null;
+      if (!finalFile) {
+        try {
+          const stray = fs.readdirSync(TEMP_DIR).find((f) => f.startsWith(jobId) && !f.endsWith('.part'));
+          if (stray) finalFile = path.join(TEMP_DIR, stray);
+        } catch (e) {}
+      }
+
+      if (dlCode === 0 && finalFile && fs.existsSync(finalFile)) {
+        freeSlot();
+        const stat = fs.statSync(finalFile);
+        const size = formatFileSize(stat.size);
+
+        jobData.fileName = `${jobId}.${ext}`;
+        jobData.filePath = finalFile;
+        jobData.fileSize = size;
+        jobData.lastStatus = {
+          status: 'completed',
+          percent: 100,
+          jobId,
+          fileName: `${jobId}.${ext}`,
+          size,
+          downloadUrl: `/api/download/${jobId}?title=${encodeURIComponent(title || 'Clip')}`,
+          text: `Clip ready · ${size}`
+        };
+        sendJobEvent(jobId, jobData.lastStatus);
+        return;
+      }
+
+      // Attempt failed with this client
+      lastStderr = attemptStderr || lastStderr;
+      const tail = String(attemptStderr || lastStderr).trim().slice(-500);
+      console.error(`[Job ${jobId}] Client "${client}" failed with exit code ${dlCode}: ${tail}`);
+
+      // Clean up partial file from failed attempt before next try
+      cleanupJobTempFiles(jobId);
+
+      attempt(clientIndex + 1);
     };
-    sendJobEvent(jobId, jobData.lastStatus);
-  });
+
+    dlProc.on('error', (err) => {
+      console.error(`[Job ${jobId}] yt-dlp spawn error with client "${client}":`, err);
+      handleAttemptEnd(1, err);
+    });
+
+    dlProc.on('close', (dlCode) => {
+      handleAttemptEnd(dlCode, null);
+    });
+  };
+
+  attempt(0);
 });
 
 // Endpoint: Ultra Fast Full Video/Audio Download with Real-Time Progress Tracking
@@ -755,42 +805,86 @@ app.post('/api/convert-full', (req, res) => {
   const videoId = extractVideoId(url);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url.trim();
 
-  const ytdlArgs = [
-    ...buildBaseArgs(CLIENT_CHAIN[0]),
-    '--newline',
-    '--concurrent-fragments', '5',
-  ];
-  if (ffmpegPath) {
-    ytdlArgs.push('--ffmpeg-location', ffmpegPath);
-  }
+  let slotFreed = false;
+  const freeSlot = () => {
+    if (slotFreed) return;
+    slotFreed = true;
+    releaseJobSlot();
+  };
 
-  if (isAudio) {
-    const audioBitrate = String(quality).replace(/\D/g, '') || '320';
-    ytdlArgs.push(
-      '-f', 'bestaudio/best',
-      '-x',
-      '--audio-format', 'mp3',
-      '--audio-quality', `${audioBitrate}k`,
-      '-o', finalOutputFile
-    );
-  } else {
-    ytdlArgs.push(
-      '-f', `bestvideo[height<=?${heightVal}]+bestaudio/best[height<=?${heightVal}]/best`,
-      '--merge-output-format', 'mp4',
-      '-o', finalOutputFile
-    );
-  }
+  let lastStderr = '';
 
-  ytdlArgs.push(targetUrl);
+  const attempt = (clientIndex) => {
+    if (clientIndex >= CLIENT_CHAIN.length) {
+      freeSlot();
+      cleanupJobTempFiles(jobId);
+      const tail = lastStderr.trim().slice(-500);
+      console.error(`[Job ${jobId}] All player clients failed. Last stderr: ${tail}`);
+      jobData.lastStatus = {
+        status: 'error',
+        message: 'Could not complete the download. Check your connection and try again.',
+        details: tail || undefined
+      };
+      sendJobEvent(jobId, jobData.lastStatus);
+      return;
+    }
 
-  console.log(`[Job ${jobId}] Starting Full High-Speed Download (${qualityLabel}):`, ytdlArgs.join(' '));
-  const dlProc = spawn(ytDlpPath, ytdlArgs);
+    const client = CLIENT_CHAIN[clientIndex];
+    const ytdlArgs = [
+      ...buildBaseArgs(client),
+      '--newline',
+      '--concurrent-fragments', '5',
+    ];
+    if (ffmpegPath) {
+      ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+    }
 
-  dlProc.stdout.on('data', (chunk) => {
-    for (const line of chunk.toString().split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const dlMatch = trimmed.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+    if (isAudio) {
+      const audioBitrate = String(quality).replace(/\D/g, '') || '320';
+      ytdlArgs.push(
+        '-f', 'bestaudio/best',
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', `${audioBitrate}k`,
+        '-o', finalOutputFile
+      );
+    } else {
+      ytdlArgs.push(
+        '-f', `bestvideo[height<=?${heightVal}]+bestaudio/best[height<=?${heightVal}]/best`,
+        '--merge-output-format', 'mp4',
+        '-o', finalOutputFile
+      );
+    }
+
+    ytdlArgs.push(targetUrl);
+
+    console.log(`[Job ${jobId}] Starting Full High-Speed Download attempt ${clientIndex + 1}/${CLIENT_CHAIN.length} (client: "${client}", ${qualityLabel}):`, ytdlArgs.join(' '));
+
+    let attemptStderr = '';
+    let attemptSettled = false;
+    const dlProc = spawn(ytDlpPath, ytdlArgs);
+
+    dlProc.stdout.on('data', (chunk) => {
+      for (const line of chunk.toString().split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const dlMatch = trimmed.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+        if (dlMatch) {
+          const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
+          jobData.lastStatus = {
+            status: 'downloading',
+            percent,
+            text: `Downloading ${qualityLabel}: ${percent}%`
+          };
+          sendJobEvent(jobId, jobData.lastStatus);
+        }
+      }
+    });
+
+    dlProc.stderr.on('data', (chunk) => {
+      const str = chunk.toString();
+      attemptStderr += str;
+      const dlMatch = str.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
       if (dlMatch) {
         const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
         jobData.lastStatus = {
@@ -800,72 +894,67 @@ app.post('/api/convert-full', (req, res) => {
         };
         sendJobEvent(jobId, jobData.lastStatus);
       }
-    }
-  });
+    });
 
-  dlProc.stderr.on('data', (chunk) => {
-    const str = chunk.toString();
-    const dlMatch = str.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
-    if (dlMatch) {
-      const percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
-      jobData.lastStatus = {
-        status: 'downloading',
-        percent,
-        text: `Downloading ${qualityLabel}: ${percent}%`
-      };
-      sendJobEvent(jobId, jobData.lastStatus);
-    }
-  });
+    const handleAttemptEnd = (dlCode, err) => {
+      if (attemptSettled) return;
+      attemptSettled = true;
 
-  let slotFreed = false;
-  const freeSlot = () => {
-    if (slotFreed) return;
-    slotFreed = true;
-    releaseJobSlot();
+      if (err) {
+        attemptStderr += `\n[spawn error] ${err.message || err}`;
+      }
+
+      let finalFile = fs.existsSync(finalOutputFile) ? finalOutputFile : null;
+      if (!finalFile) {
+        try {
+          const stray = fs.readdirSync(TEMP_DIR).find((f) => f.startsWith(jobId) && !f.endsWith('.part'));
+          if (stray) finalFile = path.join(TEMP_DIR, stray);
+        } catch (e) {}
+      }
+
+      if (dlCode === 0 && finalFile && fs.existsSync(finalFile)) {
+        freeSlot();
+        const stat = fs.statSync(finalFile);
+        const size = formatFileSize(stat.size);
+
+        jobData.fileName = `${jobId}.${ext}`;
+        jobData.filePath = finalFile;
+        jobData.fileSize = size;
+        jobData.lastStatus = {
+          status: 'completed',
+          percent: 100,
+          jobId,
+          fileName: `${jobId}.${ext}`,
+          size,
+          downloadUrl: `/api/download/${jobId}?title=${encodeURIComponent(title || 'Download')}`,
+          text: `Ready · ${size}`
+        };
+        sendJobEvent(jobId, jobData.lastStatus);
+        return;
+      }
+
+      // Attempt failed with this client
+      lastStderr = attemptStderr || lastStderr;
+      const tail = String(attemptStderr || lastStderr).trim().slice(-500);
+      console.error(`[Job ${jobId}] Client "${client}" failed with exit code ${dlCode}: ${tail}`);
+
+      // Clean up partial file from failed attempt before next try
+      cleanupJobTempFiles(jobId);
+
+      attempt(clientIndex + 1);
+    };
+
+    dlProc.on('error', (err) => {
+      console.error(`[Job ${jobId}] yt-dlp spawn error with client "${client}":`, err);
+      handleAttemptEnd(1, err);
+    });
+
+    dlProc.on('close', (dlCode) => {
+      handleAttemptEnd(dlCode, null);
+    });
   };
 
-  dlProc.on('error', (err) => {
-    console.error(`[Job ${jobId}] yt-dlp spawn error:`, err);
-    freeSlot();
-    jobData.lastStatus = { status: 'error', message: 'Could not start the download.' };
-    sendJobEvent(jobId, jobData.lastStatus);
-  });
-
-  dlProc.on('close', (dlCode) => {
-    freeSlot();
-    let finalFile = fs.existsSync(finalOutputFile) ? finalOutputFile : null;
-    if (!finalFile) {
-      const stray = fs.readdirSync(TEMP_DIR).find((f) => f.startsWith(jobId) && !f.endsWith('.part'));
-      if (stray) finalFile = path.join(TEMP_DIR, stray);
-    }
-
-    if (dlCode !== 0 || !finalFile || !fs.existsSync(finalFile)) {
-      console.error(`[Job ${jobId}] Download failed with code ${dlCode}`);
-      jobData.lastStatus = {
-        status: 'error',
-        message: 'Could not complete the download. Check your connection and try again.'
-      };
-      sendJobEvent(jobId, jobData.lastStatus);
-      return;
-    }
-
-    const stat = fs.statSync(finalFile);
-    const size = formatFileSize(stat.size);
-
-    jobData.fileName = `${jobId}.${ext}`;
-    jobData.filePath = finalFile;
-    jobData.fileSize = size;
-    jobData.lastStatus = {
-      status: 'completed',
-      percent: 100,
-      jobId,
-      fileName: `${jobId}.${ext}`,
-      size,
-      downloadUrl: `/api/download/${jobId}?title=${encodeURIComponent(title || 'Download')}`,
-      text: `Ready · ${size}`
-    };
-    sendJobEvent(jobId, jobData.lastStatus);
-  });
+  attempt(0);
 });
 
 // Endpoint: Direct streaming download (no trim) — MP3 or MP4
